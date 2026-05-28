@@ -1,0 +1,12 @@
+# Task
+
+`rate-limiter.py` is a rate limiter for Open WebUI. It is designed to work with a single worker,
+and does not work as intended when there is multiple uvicorn workers. Please modify it to use
+redis for tracking, so that it will work with multiple workers. 
+
+I have included the Open WebUI launch script `oi-launch.sh`, 
+which shows the information needed to access redis. 
+
+Because each model will have its own rate limiter---its own rate-limiter.py---the tracking will 
+need to accomodate for that setup. My idea is to have a valve for some identifier, but you can 
+suggest how to do so.
