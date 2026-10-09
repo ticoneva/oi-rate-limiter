@@ -1,0 +1,1 @@
+Right now the limit is based on request count and not token count, which is not how rate limit is commonly done in practice. Would it be possible to set limit based on token count in Open WebUI? You can investigate the code base of open webui and search community-contributed filters as needed.     
