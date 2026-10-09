@@ -629,7 +629,7 @@ desc = status_events[0]["data"]["description"] if status_events else ""
 # Status shows where the user stands before this request's hold is placed.
 check(
     "first request status starts at zero",
-    desc == "Credits: 0/2.0K session (0%) - 0/10K week (0%)",
+    desc == "Credits: 0.0/2.0K session (0.0%) - 0.0/10K week (0.0%)",
     desc,
 )
 check("status event marked done", status_events and status_events[0]["data"].get("done") is True)
@@ -641,7 +641,7 @@ run_inlet(f, {"stream": True, "messages": []}, emitter=emitter2)
 desc2 = [e for e in emitter2.events if e.get("type") == "status"][0]["data"]["description"]
 check(
     "status reflects recorded usage after completion",
-    desc2 == "Credits: 300/2.0K session (15%) - 300/10K week (3%)",
+    desc2 == "Credits: 300/2.0K session (15%) - 300/10K week (3.0%)",
     desc2,
 )
 
@@ -749,7 +749,7 @@ check("live statuses emitted during stream", len(live) == 3, [s["data"]["descrip
 if len(live) == 3:
     check(
         "live count grows with generated content",
-        live[0]["data"]["description"] == "Credits: 150/2.0K session (8%)"
+        live[0]["data"]["description"] == "Credits: 150/2.0K session (7.5%)"
         and live[2]["data"]["description"] == "Credits: 250/2.0K session (12%)",
         [s["data"]["description"] for s in live],
     )
@@ -800,7 +800,7 @@ check("outlet emits status even when turn already recorded via stream", len(stat
 if statuses:
     check(
         "refreshed status shows recorded usage",
-        statuses[0]["data"]["description"] == "Credits: 150/2.0K session (8%)",
+        statuses[0]["data"]["description"] == "Credits: 150/2.0K session (7.5%)",
         statuses[0]["data"]["description"],
     )
 
