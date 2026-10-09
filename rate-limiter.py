@@ -3,10 +3,11 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.8.0
+version: 0.9.0
 license: MIT
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -152,6 +153,14 @@ class Filter:
                 "Visible in the web UI; API clients ignore status events."
             ),
         )
+        status_interval_seconds: int = Field(
+            default=5,
+            description=(
+                "Minimum interval between live status updates while a response "
+                "streams. The running count includes an estimate of the tokens "
+                "generated so far in the in-flight response."
+            ),
+        )
         enabled_for_admins: bool = Field(
             default=True,
             description="Whether rate limiting is enabled for admin users.",
@@ -180,6 +189,9 @@ class Filter:
     def __init__(self):
         self._redis: Optional["redis.Redis"] = None
         self.valves = self.Valves()
+        # Per-instance live-status state: (user_id, chat_id, message_id) ->
+        # [generated_chars, last_emit_ts]. Cleared when usage records.
+        self._live: dict = {}
 
     def _get_redis(self) -> "redis.Redis":
         if self._redis is None:
@@ -518,7 +530,9 @@ class Filter:
             return f"{n / 1000:.1f}K"
         return f"{n:.0f}"
 
-    def _usage_status_message(self, user_id: str, model_id: str) -> str:
+    def _usage_status_message(
+        self, user_id: str, model_id: str, extra_credits: int = 0
+    ) -> str:
         now = time.time()
         parts = []
         for label, limit, win_secs in (
@@ -536,6 +550,7 @@ class Filter:
             if limit is None:
                 continue
             used, _ = self._used_with_holds(user_id, model_id, now, win_secs)
+            used += extra_credits
             pct = (used / limit * 100) if limit > 0 else 0
             parts.append(
                 f"{self._fmt_credits(used)}/{self._fmt_credits(limit)} {label} ({pct:.0f}%)"
@@ -544,12 +559,72 @@ class Filter:
             return "Credits: no limits configured"
         return f"Credits: {' - '.join(parts)}"
 
+    async def _tick_live_status(
+        self,
+        event: Any,
+        emitter: Callable[[Any], Awaitable[None]],
+        __user__: dict,
+        __model__: Optional[dict],
+        __metadata__: Optional[dict],
+    ):
+        """Called per stream chunk: accumulate generated characters and emit
+        a status line every status_interval_seconds showing committed credits
+        plus the in-flight response's estimated decode cost."""
+        metadata = __metadata__ or {}
+        key = (
+            __user__.get("id"),
+            metadata.get("chat_id") or "",
+            metadata.get("message_id") or "",
+        )
+        state = self._live.get(key)
+        if state is None:
+            state = [0, 0.0]
+            self._live[key] = state
+
+        state[0] += len(self._delta_text(event))
+
+        now = time.time()
+        if now - state[1] < self.valves.status_interval_seconds:
+            return
+        state[1] = now
+
+        # Estimate decode tokens from generated chars; add on top of the
+        # user's committed credits + holds (which already include this
+        # request's input estimate).
+        divisor = self.valves.chars_per_token or 3.0
+        est_tokens = int(state[0] / divisor)
+        extra = round(self.valves.output_weight * est_tokens)
+
+        message = self._usage_status_message(
+            __user__["id"],
+            __model__["id"] if __model__ is not None else "default_model",
+            extra,
+        )
+        user_valves = __user__.get("valves")
+        if user_valves is not None and not getattr(
+            user_valves, "show_usage_status", True
+        ):
+            return
+        await emitter(
+            {"type": "status", "data": {"description": message, "done": False}}
+        )
+
+    def _clear_live_status(self, __user__: dict, __metadata__: Optional[dict]):
+        metadata = __metadata__ or {}
+        key = (
+            __user__.get("id"),
+            metadata.get("chat_id") or "",
+            metadata.get("message_id") or "",
+        )
+        self._live.pop(key, None)
+
     async def _emit_usage_status(
         self,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]],
         __user__: dict,
         user_id: str,
         model_id: str,
+        extra_credits: int = 0,
     ):
         if __event_emitter__ is None:
             return
@@ -563,13 +638,45 @@ class Filter:
                 {
                     "type": "status",
                     "data": {
-                        "description": self._usage_status_message(user_id, model_id),
+                        "description": self._usage_status_message(
+                            user_id, model_id, extra_credits
+                        ),
                         "done": True,
                     },
                 }
             )
         except Exception as e:
             print(f"rate-limiter: failed to emit usage status: {e}")
+
+    @staticmethod
+    def _delta_text(chunk: Any) -> str:
+        """Content delta of a streamed chunk, if any (dict or raw SSE line)."""
+        if isinstance(chunk, dict):
+            choices = chunk.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                return content if isinstance(content, str) else ""
+        elif isinstance(chunk, (str, bytes)):
+            text = (
+                chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
+            )
+            stripped = text.strip()
+            if stripped.startswith("data:"):
+                payload = stripped[len("data:") :].strip()
+                if payload and payload != "[DONE]":
+                    try:
+                        data = json.loads(payload)
+                    except json.JSONDecodeError:
+                        return ""
+                    if isinstance(data, dict):
+                        choices = data.get("choices") or []
+                        if choices and isinstance(choices[0], dict):
+                            delta = choices[0].get("delta") or {}
+                            content = delta.get("content")
+                            if isinstance(content, str):
+                                return content
+        return ""
 
     async def inlet(
         self,
@@ -646,11 +753,13 @@ class Filter:
     async def stream(
         self,
         event: Any,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> Any:
-        """Record actual token usage from usage-bearing stream chunks.
+        """Record actual token usage from usage-bearing stream chunks, and
+        keep the usage status line ticking while a response streams.
 
         The web UI path delivers each chunk as a parsed dict; the API path
         (no websocket session) delivers raw SSE lines. The event is always
@@ -658,6 +767,21 @@ class Filter:
         """
         if not self._credit_limits_configured() or not self._enforced_for(__user__):
             return event
+
+        # Live status: estimate in-flight decode cost from content deltas.
+        # The stream hook is invoked per chunk, so per-chunk state lives in
+        # a shared per-instance dict keyed by (user, message).
+        if (
+            self.valves.show_usage_status
+            and __event_emitter__ is not None
+            and self.valves.output_weight > 0
+        ):
+            try:
+                await self._tick_live_status(
+                    event, __event_emitter__, __user__, __model__, __metadata__
+                )
+            except Exception as e:
+                print(f"rate-limiter: live status tick failed: {e}")
 
         if isinstance(event, dict):
             usage = event.get("usage")
@@ -699,6 +823,7 @@ class Filter:
         user_id = __user__["id"]
         model_id = __model__["id"] if __model__ is not None else "default_model"
         try:
+            self._clear_live_status(__user__, __metadata__)
             self._record_usage(user_id, model_id, input_tokens, cached_tokens, output_tokens)
 
             # Mark this chat turn as accounted, so the outlet hook (which
@@ -734,14 +859,24 @@ class Filter:
 
         chat_id = body.get("chat_id")
         message_id = body.get("id")
+        already_recorded = False
         if chat_id and message_id:
             try:
-                if self._get_redis().exists(
-                    self._done_marker_key(namespace, user_id, chat_id, message_id)
-                ):
-                    return body
+                already_recorded = bool(
+                    self._get_redis().exists(
+                        self._done_marker_key(namespace, user_id, chat_id, message_id)
+                    )
+                )
             except Exception:
                 return body
+        if already_recorded:
+            # The stream hook already accounted this turn; still refresh the
+            # status line so the user sees post-turn numbers.
+            if self.valves.show_usage_status:
+                await self._emit_usage_status(
+                    __event_emitter__, __user__, user_id, model_id
+                )
+            return body
 
         usage = body.get("usage")
         if not usage:

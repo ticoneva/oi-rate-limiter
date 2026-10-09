@@ -85,12 +85,17 @@ def run_inlet(f, body, metadata=None, model=MODEL, u=None, emitter=None):
     )
 
 
-def run_stream(f, chunk, metadata=None, model=MODEL, u=None):
-    return asyncio.run(
-        f.stream(
-            chunk, __user__=u or user(), __model__=model, __metadata__=metadata or {}
+def run_stream(f, chunk, metadata=None, model=MODEL, u=None, emitter=None):
+    async def _call():
+        return await f.stream(
+            chunk,
+            __event_emitter__=emitter,
+            __user__=u or user(),
+            __model__=model,
+            __metadata__=metadata or {},
         )
-    )
+
+    return asyncio.run(_call())
 
 
 def run_outlet(f, body, model=MODEL, u=None):
@@ -716,6 +721,88 @@ f = make_filter(
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=1500, completion_tokens=0))
 msg = f._usage_status_message("u1", "glm-5.3")
 check("K formatting", msg.startswith("Credits: 1.5K/2.0K session (75%)"), msg)
+
+print("== 29. Live status ticks during generation ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000, show_usage_status=True, chars_per_token=1.0,
+    status_interval_seconds=0,  # emit on every chunk for testing
+)
+meta = {"chat_id": "c1", "message_id": "m1"}
+emitter = TestEventEmitter()
+
+# inlet: hold 100
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 100}]}, emitter=emitter, metadata=meta)
+
+# stream several content deltas
+for i in range(3):
+    run_stream(
+        f,
+        {"id": "x", "choices": [{"delta": {"content": "b" * 50}}]},
+        metadata=meta,
+        emitter=emitter,
+    )
+# each tick: 50/100/150 chars -> 50/100/150 est tokens x weight 1
+statuses = [e for e in emitter.events if e.get("type") == "status"]
+live = [s for s in statuses if s["data"].get("done") is False]
+check("live statuses emitted during stream", len(live) == 3, [s["data"]["description"] for s in live])
+if len(live) == 3:
+    check(
+        "live count grows with generated content",
+        live[0]["data"]["description"] == "Credits: 150/2.0K session (8%)"
+        and live[2]["data"]["description"] == "Credits: 250/2.0K session (12%)",
+        [s["data"]["description"] for s in live],
+    )
+
+# final chunk records usage and clears live state
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=150), metadata=meta, emitter=emitter)
+run_stream(f, {"id": "x", "choices": [{"delta": {"content": "b" * 10}}]}, metadata=meta, emitter=emitter)
+statuses_after = [e for e in emitter.events if e.get("type") == "status"]
+live_after = [s for s in statuses_after if s["data"].get("done") is False]
+# After recording 250 exact, the live counter restarts: 250 recorded + 10 new
+check(
+    "live counter reset after usage records (new turn counts from 0)",
+    live_after and live_after[-1]["data"]["description"] == "Credits: 260/2.0K session (13%)",
+    [s["data"]["description"] for s in live_after],
+)
+
+print("== 30. Outlet refreshes status after streaming turn ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000, show_usage_status=True,
+)
+meta = {"chat_id": "c2", "message_id": "m2"}
+run_inlet(f, {"stream": True, "messages": []}, metadata=meta)
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=50), metadata=meta)  # 150 recorded
+emitter = TestEventEmitter()
+asyncio.run(
+    f.outlet(
+        {
+            "model": "glm-5.3",
+            "chat_id": "c2",
+            "id": "m2",
+            "messages": [
+                {
+                    "id": "m2",
+                    "role": "assistant",
+                    "content": "x",
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                }
+            ],
+        },
+        __event_emitter__=emitter,
+        __user__=user(),
+        __model__=MODEL,
+    )
+)
+statuses = [e for e in emitter.events if e.get("type") == "status"]
+check("outlet emits status even when turn already recorded via stream", len(statuses) == 1, emitter.events)
+if statuses:
+    check(
+        "refreshed status shows recorded usage",
+        statuses[0]["data"]["description"] == "Credits: 150/2.0K session (8%)",
+        statuses[0]["data"]["description"],
+    )
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

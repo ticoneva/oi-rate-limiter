@@ -73,9 +73,11 @@ Credits: 340/2.0K session (17%) - 4210/10K week (42%)
 
 The line shows committed credits plus live holds for each configured window
 (session and weekly; only configured limits appear). It is emitted at request
-time (showing where the user stands before the new request is charged) and
-refreshed after a web-UI turn completes. Users can hide the line for
-themselves via the filter's user valves — hiding it does not affect
+time (showing where the user stands before the new request is charged),
+**ticks live while a response streams** (every `status_interval_seconds`,
+adding an estimate of the in-flight response's decode cost from its generated
+content), and is refreshed after a web-UI turn completes. Users can hide the
+line for themselves via the filter's user valves — hiding it does not affect
 enforcement. API clients ignore status events entirely.
 
 To discount cache hits, vLLM must be started with
@@ -110,6 +112,7 @@ the same field).
 | `hold_output_reserve_tokens` | 0 | Decode tokens reserved per hold, on top of the input estimate |
 | `hold_ttl_minutes` | 15 | Lifespan of a hold whose request never reports usage |
 | `show_usage_status` | False | Emit a status line at request time showing credit consumption per session/window |
+| `status_interval_seconds` | 5 | Minimum interval between live status updates during streaming |
 | `enabled_for_admins` | True | Whether admins are also rate-limited |
 | `redis_url` | `redis://redis-valkey:6379/0` | Redis connection URL |
 | `rate_limiter_id` | (empty) | Namespace for this limiter; leave empty to use the model ID, or set the same ID on multiple instances to share a combined budget |
