@@ -629,7 +629,7 @@ desc = status_events[0]["data"]["description"] if status_events else ""
 # Status shows where the user stands before this request's hold is placed.
 check(
     "first request status starts at zero",
-    desc == "Credits: 0.0/2.0K session (0.0%) - 0.0/10K week (0.0%)",
+    desc == "Credits: 0/2000 session (0.0%) - 0/10K week (0.0%)",
     desc,
 )
 check("status event marked done", status_events and status_events[0]["data"].get("done") is True)
@@ -641,7 +641,7 @@ run_inlet(f, {"stream": True, "messages": []}, emitter=emitter2)
 desc2 = [e for e in emitter2.events if e.get("type") == "status"][0]["data"]["description"]
 check(
     "status reflects recorded usage after completion",
-    desc2 == "Credits: 300/2.0K session (15%) - 300/10K week (3.0%)",
+    desc2 == "Credits: 300/2000 session (15.0%) - 300/10K week (3.0%)",
     desc2,
 )
 
@@ -709,7 +709,7 @@ check("outlet emits refreshed status", len(statuses) == 1, emitter.events)
 if statuses:
     check(
         "outlet status includes new record",
-        "300/2.0K session" in statuses[0]["data"]["description"],
+        "300/2000 session" in statuses[0]["data"]["description"],
         statuses[0]["data"]["description"],
     )
 
@@ -720,7 +720,7 @@ f = make_filter(
 )
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=1500, completion_tokens=0))
 msg = f._usage_status_message("u1", "glm-5.3")
-check("K formatting", msg.startswith("Credits: 1.5K/2.0K session (75%)"), msg)
+check("integer formatting below 10K", msg.startswith("Credits: 1500/2000 session (75.0%)"), msg)
 
 print("== 29. Live status ticks during generation ==")
 f = make_filter(
@@ -749,8 +749,8 @@ check("live statuses emitted during stream", len(live) == 3, [s["data"]["descrip
 if len(live) == 3:
     check(
         "live count grows with generated content",
-        live[0]["data"]["description"] == "Credits: 150/2.0K session (7.5%)"
-        and live[2]["data"]["description"] == "Credits: 250/2.0K session (12%)",
+        live[0]["data"]["description"] == "Credits: 150/2000 session (7.5%)"
+        and live[2]["data"]["description"] == "Credits: 250/2000 session (12.5%)",
         [s["data"]["description"] for s in live],
     )
 
@@ -762,7 +762,7 @@ live_after = [s for s in statuses_after if s["data"].get("done") is False]
 # After recording 250 exact, the live counter restarts: 250 recorded + 10 new
 check(
     "live counter reset after usage records (new turn counts from 0)",
-    live_after and live_after[-1]["data"]["description"] == "Credits: 260/2.0K session (13%)",
+    live_after and live_after[-1]["data"]["description"] == "Credits: 260/2000 session (13.0%)",
     [s["data"]["description"] for s in live_after],
 )
 
@@ -800,7 +800,7 @@ check("outlet emits status even when turn already recorded via stream", len(stat
 if statuses:
     check(
         "refreshed status shows recorded usage",
-        statuses[0]["data"]["description"] == "Credits: 150/2.0K session (7.5%)",
+        statuses[0]["data"]["description"] == "Credits: 150/2000 session (7.5%)",
         statuses[0]["data"]["description"],
     )
 

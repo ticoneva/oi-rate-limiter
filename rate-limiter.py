@@ -522,18 +522,14 @@ class Filter:
 
     @staticmethod
     def _fmt_credits(n: float) -> str:
-        # One significant decimal for small credit values: with provider-style
-        # weights (z.ai multipliers / 10,000) a single request charges single
-        # digits, which integer formatting would hide entirely.
+        # Plain integers below 10K: with provider-style weights (z.ai
+        # multipliers / 10,000) each request charges single-digit credits,
+        # which K-notation at one decimal would round away entirely.
         if n >= 100000:
             return f"{n / 1000000:.1f}M"
         if n >= 10000:
             return f"{n / 1000:.0f}K"
-        if n >= 1000:
-            return f"{n / 1000:.1f}K"
-        if n >= 10:
-            return f"{n:.0f}"
-        return f"{n:.1f}"
+        return f"{n:.0f}"
 
     def _usage_status_message(
         self, user_id: str, model_id: str, extra_credits: int = 0
@@ -557,16 +553,11 @@ class Filter:
             used, _ = self._used_with_holds(user_id, model_id, now, win_secs)
             used += extra_credits
             pct = (used / limit * 100) if limit > 0 else 0
-            # One decimal below 10%: with provider-scaled weights each
-            # request moves the percentage by well under a point.
-            if pct < 10 and limit > 0:
-                parts.append(
-                    f"{self._fmt_credits(used)}/{self._fmt_credits(limit)} {label} ({pct:.1f}%)"
-                )
-            else:
-                parts.append(
-                    f"{self._fmt_credits(used)}/{self._fmt_credits(limit)} {label} ({pct:.0f}%)"
-                )
+            # One decimal throughout: with provider-scaled weights each
+            # request moves the percentage by well under a whole point.
+            parts.append(
+                f"{self._fmt_credits(used)}/{self._fmt_credits(limit)} {label} ({pct:.1f}%)"
+            )
         if not parts:
             return "Credits: no limits configured"
         return f"Credits: {' - '.join(parts)}"
