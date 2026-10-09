@@ -453,6 +453,117 @@ except Exception as e:
     blocked = "Rate limit" in str(e)
 check("request limit still enforced independently", blocked)
 
+print("== 19. Concurrent burst: holds block at the door ==")
+# User with empty history fires many simultaneous streaming requests whose
+# combined actual cost would exceed the budget. With holds, request k sees
+# the k-1 pending estimates and gets blocked before generating.
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    sliding_window_credits=600, chars_per_token=1.0,  # 300-char prompt = 300 est
+)
+body = {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]}
+admitted = 0
+for i in range(10):
+    try:
+        run_inlet(f, dict(body))
+        admitted += 1
+    except Exception:
+        break
+check("burst admitted only twice (600 budget / 300 per hold)", admitted == 2, admitted)
+
+# Each request completes and records its exact usage: 200 in + 100 out = 300
+for i in range(admitted):
+    run_stream(f, vllm_final_chunk_dict(prompt_tokens=200, completion_tokens=100))
+# Redis removes a zset key when its last member is deleted, so a fully
+# released hold set means the key is gone entirely.
+check(
+    "all holds released after usage records",
+    not [k for k in f._get_redis().keys() if k.endswith(":holds")],
+)
+credits_key = [k for k in f._get_redis().keys() if k.endswith(":credits")][0]
+members = f._get_redis().zrange(credits_key, 0, -1)
+check("exact usage replaced estimates", len(members) == 2, members)
+
+print("== 20. Hold charges estimate, not double ==")
+# With all requests completed, the recorded total is the exact charge only.
+charges = sorted(m.rsplit(":", 1)[1] for m in members)
+check("net charge = exact usage (300 x 2)", charges == ["300", "300"], charges)
+
+print("== 21. Abandoned request: hold expires via TTL ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    sliding_window_credits=600, chars_per_token=1.0, hold_ttl_minutes=15,
+)
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]})
+# request dies without reporting usage: TTL removes the hold
+holds_key = "oi-rate-limiter:glm-5.3:u1:holds"
+ttl = f._get_redis().ttl(holds_key)
+check("hold key has TTL", 0 < ttl <= 15 * 60, ttl)
+limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+check("hold counts toward usage while live", used == 300, used)
+f._get_redis().delete(holds_key)  # simulate expiry
+limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+check("expired hold stops counting", used == 0, used)
+
+print("== 22. Output reserve in hold ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    sliding_window_credits=10000, chars_per_token=1.0,
+    hold_output_reserve_tokens=100, output_weight=4.0,
+)
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 100}]})
+members = f._get_redis().zrange("oi-rate-limiter:glm-5.3:u1:holds", 0, -1)
+# 100 in x 1.0 + 100 out-reserve x 4.0 = 500
+check("hold includes output reserve", members[0].rsplit(":", 1)[1] == "500", members)
+
+print("== 23. Session window (z.ai 5-hour style) ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=500, session_window_minutes=300,
+    sliding_window_credits=None, chars_per_token=1.0,
+)
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]})
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=300, completion_tokens=100))  # 400
+limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+check("session window counts usage", used == 400 and not limited, (used, lim))
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 100}]})
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=0))  # +100
+limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+check("session limit blocks at 500", limited and used == 500 and lim == 500, (limited, used, lim))
+check("wait is bounded by the 5h window", wait is not None and wait <= 300 * 60, wait)
+
+print("== 24. Holds disabled -> original post-hoc behavior ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    sliding_window_credits=600, chars_per_token=1.0, hold_credits_at_inlet=False,
+)
+body = {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]}
+admitted = 0
+for i in range(10):
+    try:
+        run_inlet(f, dict(body))
+        admitted += 1
+    except Exception:
+        break
+check(
+    "all burst admitted when holds off",
+    admitted == 10 and not [k for k in f._get_redis().keys() if k.endswith(":holds")],
+    admitted,
+)
+
+print("== 25. max_tokens cap sees holds too ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    sliding_window_credits=1000, chars_per_token=1.0,
+    cap_max_tokens_to_budget=True, hold_output_reserve_tokens=0,
+)
+body1 = {"stream": True, "messages": [{"role": "user", "content": "a" * 800}]}
+run_inlet(f, body1)  # hold 800
+body2 = {"stream": True, "messages": [{"role": "user", "content": "a" * 100}]}
+run_inlet(f, body2)
+# remaining = 1000 - 800 - 100 = 100 -> max_tokens = 100
+check("max_tokens cap accounts for sibling holds", body2.get("max_tokens") == 100, body2)
+
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

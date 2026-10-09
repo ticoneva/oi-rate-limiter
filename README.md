@@ -45,6 +45,23 @@ The filter injects `stream_options: {include_usage: true}` into streaming
 requests so OpenAI-compatible backends (vLLM, etc.) report usage in the final
 chunk; a client-supplied `stream_options` is preserved.
 
+### Admission control (holds)
+
+Usage is only visible when a response completes, so without further measures a
+user firing many simultaneous requests could pass every per-request check
+against the same (empty) history and overrun the budget — throttling would
+only start with the next request. To prevent this, every admitted streaming
+request *reserves* an estimated charge (an input-token estimate plus an
+optional per-request decode reserve) as a **hold** in a short-lived Redis
+sorted set. Holds count toward every credit check, so sibling requests see
+each other's pending cost and are blocked at the door. When a request's exact
+usage is recorded, its hold is released (FIFO) and replaced by the actual
+charge; if a request dies without reporting usage (e.g. a client disconnects
+mid-stream), the hold expires via its key TTL. With the default
+`hold_output_reserve_tokens: 0`, holds reserve prefill cost only — pair them
+with `cap_max_tokens_to_budget` to also bound decode on parallel bursts, or
+set an output reserve to cover it directly.
+
 To discount cache hits, vLLM must be started with
 `--enable-prompt-tokens-details` so usage includes
 `prompt_tokens_details.cached_tokens`. When the field is absent (other
@@ -62,7 +79,8 @@ the same field).
 | `sliding_window_limit` | 100 | Max requests per sliding window |
 | `sliding_window_minutes` | 180 | Request sliding window duration in minutes |
 | `credits_per_minute` | (disabled) | Credit budget per minute per user |
-| `credits_per_hour` | (disabled) | Credit budget per hour per user |
+| `credits_per_session` | (disabled) | Credit budget per session window (z.ai uses 5 hours) |
+| `session_window_minutes` | 300 | Session credit window duration in minutes |
 | `sliding_window_credits` | (disabled) | Credit budget per credit window |
 | `credit_window_minutes` | 1440 | Credit sliding window duration in minutes |
 | `input_weight` | 1.0 | Credit cost of one uncached prefill token |
@@ -72,6 +90,9 @@ the same field).
 | `estimate_nonstreaming_tokens` | True | Charge an input estimate for non-streaming API calls |
 | `chars_per_token` | 3.0 | Characters per token for the non-streaming estimate (use ~1.5–2 for CJK-heavy traffic) |
 | `cap_max_tokens_to_budget` | False | Clamp `max_tokens` to the remaining budget ÷ `output_weight` |
+| `hold_credits_at_inlet` | True | Reserve estimated credits at admission so simultaneous requests block at the door |
+| `hold_output_reserve_tokens` | 0 | Decode tokens reserved per hold, on top of the input estimate |
+| `hold_ttl_minutes` | 15 | Lifespan of a hold whose request never reports usage |
 | `enabled_for_admins` | True | Whether admins are also rate-limited |
 | `redis_url` | `redis://redis-valkey:6379/0` | Redis connection URL |
 | `rate_limiter_id` | (empty) | Namespace for this limiter; leave empty to use the model ID, or set the same ID on multiple instances to share a combined budget |
@@ -86,6 +107,8 @@ request-limiting behavior is unchanged until a credit limit is set.
 - `oi-rate-limiter:{namespace}:{user_id}:credits` — credit records; sorted-set
   members are `{timestamp}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}`
   so raw splits survive for reporting and re-derivation
+- `oi-rate-limiter:{namespace}:{user_id}:holds` — admission holds; members are
+  `{timestamp}:{uuid}:{amount}`, TTL-bounded
 - `oi-rate-limiter:{namespace}:{user_id}:done:{chat_id}:{message_id}` —
   15-minute markers preventing stream/outlet double-counting
 

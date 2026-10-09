@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.5.0
+version: 0.6.0
 license: MIT
 """
 
@@ -41,9 +41,16 @@ class Filter:
                 "+ output_weight x decode. None disables this period."
             ),
         )
-        credits_per_hour: Optional[int] = Field(
+        credits_per_session: Optional[int] = Field(
             default=None,
-            description="Credit budget per hour per user. None disables this period.",
+            description=(
+                "Credit budget per session window per user (z.ai uses a 5-hour "
+                "window). None disables this period."
+            ),
+        )
+        session_window_minutes: int = Field(
+            default=300,
+            description="Duration of the session credit window in minutes.",
         )
         sliding_window_credits: Optional[int] = Field(
             default=None,
@@ -101,6 +108,32 @@ class Filter:
                 "before a limit is hit."
             ),
         )
+        hold_credits_at_inlet: bool = Field(
+            default=True,
+            description=(
+                "Reserve an estimated credit charge when a request is admitted, so "
+                "simultaneous requests from the same user each see their siblings' "
+                "pending cost and are blocked at the door instead of overrunning the "
+                "budget. Holds are released (and replaced by exact charges) when usage "
+                "records, and expire if a request dies without reporting usage."
+            ),
+        )
+        hold_output_reserve_tokens: int = Field(
+            default=0,
+            description=(
+                "Decode tokens reserved per hold on top of the input estimate, so "
+                "many small-prompt large-output requests cannot under-reserve. "
+                "0 disables the output reserve."
+            ),
+        )
+        hold_ttl_minutes: int = Field(
+            default=15,
+            description=(
+                "Lifespan of a hold whose request never reports usage (e.g. client "
+                "disconnect mid-stream). Should exceed your longest normal request "
+                "duration."
+            ),
+        )
         enabled_for_admins: bool = Field(
             default=True,
             description="Whether rate limiting is enabled for admin users.",
@@ -137,6 +170,10 @@ class Filter:
     @staticmethod
     def _credit_key(namespace: str, user_id: str) -> str:
         return f"oi-rate-limiter:{namespace}:{user_id}:credits"
+
+    @staticmethod
+    def _holds_key(namespace: str, user_id: str) -> str:
+        return f"oi-rate-limiter:{namespace}:{user_id}:holds"
 
     @staticmethod
     def _done_marker_key(
@@ -203,18 +240,30 @@ class Filter:
             v is not None
             for v in (
                 self.valves.credits_per_minute,
-                self.valves.credits_per_hour,
+                self.valves.credits_per_session,
                 self.valves.sliding_window_credits,
             )
         )
+
+    def _credit_windows(self) -> list:
+        """Active (limit, window_seconds) pairs, ascending window length."""
+        return [
+            (limit, secs)
+            for limit, secs in (
+                (self.valves.credits_per_minute, 60),
+                (self.valves.credits_per_session, self.valves.session_window_minutes * 60),
+                (self.valves.sliding_window_credits, self.valves.credit_window_minutes * 60),
+            )
+            if limit is not None
+        ]
 
     def _credit_retention_secs(self) -> int:
         """Records are kept at least as long as the longest active window."""
         retention = self.valves.credit_window_minutes * 60
         if self.valves.credits_per_minute is not None:
             retention = max(retention, 60)
-        if self.valves.credits_per_hour is not None:
-            retention = max(retention, 3600)
+        if self.valves.credits_per_session is not None:
+            retention = max(retention, self.valves.session_window_minutes * 60)
         return retention
 
     def _sum_credits(self, key: str, start: float, end: float) -> int:
@@ -227,11 +276,34 @@ class Filter:
                 continue
         return total
 
+    def _used_with_holds(
+        self, user_id: str, model_id: str, now: float, win_secs: float
+    ) -> Tuple[int, Optional[float]]:
+        """Committed credits plus live holds within the window. Returns
+        (used, earliest_record_ts) — the earliest record (not hold) drives the
+        retry-time message."""
+        namespace = self._get_namespace(model_id)
+        credit_key = self._credit_key(namespace, user_id)
+        holds_key = self._holds_key(namespace, user_id)
+
+        used = self._sum_credits(credit_key, now - win_secs, "+inf")
+        earliest = self._earliest_key(credit_key, now - win_secs, "+inf")
+
+        # Holds are "{ts}:{uuid}:{amount}" with a key TTL bounding their life;
+        # score-based pruning mirrors it in case the TTL has not fired yet.
+        for member in self._get_redis().zrangebyscore(holds_key, now - win_secs, "+inf"):
+            try:
+                used += int(float(member.rsplit(":", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+        return used, earliest
+
     def credit_limited(
         self, user_id: str, model_id: str
     ) -> Tuple[bool, Optional[int], int, Optional[int]]:
         """Returns (limited, wait_seconds, used, limit) where (used, limit)
-        describe the window closest to its limit, even when not limited."""
+        describe the window closest to its limit, even when not limited.
+        Pending holds count toward usage."""
         namespace = self._get_namespace(model_id)
         key = self._credit_key(namespace, user_id)
         now = time.time()
@@ -241,16 +313,9 @@ class Filter:
 
         best_used, best_limit = 0, None
         best_ratio = -1.0
-        for limit, win_secs in (
-            (self.valves.credits_per_minute, 60),
-            (self.valves.credits_per_hour, 3600),
-            (self.valves.sliding_window_credits, window_secs),
-        ):
-            if limit is None:
-                continue
-            used = self._sum_credits(key, now - win_secs, "+inf")
+        for limit, win_secs in self._credit_windows():
+            used, earliest = self._used_with_holds(user_id, model_id, now, win_secs)
             if used >= limit:
-                earliest = self._earliest_key(key, now - win_secs, "+inf")
                 wait = int(win_secs - (now - (earliest if earliest else now)))
                 return True, wait, used, limit
             ratio = used / limit
@@ -260,23 +325,45 @@ class Filter:
         return False, None, best_used, best_limit
 
     def _remaining_credits(self, user_id: str, model_id: str) -> Optional[int]:
-        namespace = self._get_namespace(model_id)
-        key = self._credit_key(namespace, user_id)
         now = time.time()
-        window_secs = self.valves.credit_window_minutes * 60
 
         remaining = None
-        for limit, win_secs in (
-            (self.valves.credits_per_minute, 60),
-            (self.valves.credits_per_hour, 3600),
-            (self.valves.sliding_window_credits, window_secs),
-        ):
-            if limit is None:
-                continue
-            room = limit - self._sum_credits(key, now - win_secs, "+inf")
+        for limit, win_secs in self._credit_windows():
+            used, _ = self._used_with_holds(user_id, model_id, now, win_secs)
+            room = limit - used
             if remaining is None or room < remaining:
                 remaining = room
         return remaining
+
+    def _charge_estimate(self, input_tokens: int) -> int:
+        """Credits reserved for a request at admission time."""
+        output_reserve = max(0, self.valves.hold_output_reserve_tokens)
+        return round(
+            self.valves.input_weight * input_tokens
+            + self.valves.output_weight * output_reserve
+        )
+
+    def _place_hold(self, user_id: str, model_id: str, estimate: int):
+        namespace = self._get_namespace(model_id)
+        key = self._holds_key(namespace, user_id)
+
+        score = time.time()
+        member = f"{score}:{uuid.uuid4().hex}:{estimate}"
+
+        r = self._get_redis()
+        with r.pipeline() as pipe:
+            pipe.zadd(key, {member: score})
+            pipe.expire(key, self.valves.hold_ttl_minutes * 60)
+            pipe.execute()
+
+    def _release_hold(self, user_id: str, model_id: str):
+        """Remove the oldest live hold (FIFO), called when exact usage is
+        recorded for a request that placed one."""
+        namespace = self._get_namespace(model_id)
+        key = self._holds_key(namespace, user_id)
+        oldest = self._get_redis().zrange(key, 0, 0)
+        if oldest:
+            self._get_redis().zrem(key, oldest[0])
 
     def _record_usage(
         self,
@@ -309,6 +396,7 @@ class Filter:
             pipe.zadd(key, {member: score})
             pipe.expire(key, self._credit_retention_secs())
             pipe.execute()
+        self._release_hold(user_id, model_id)
         return charged
 
     @staticmethod
@@ -441,13 +529,21 @@ class Filter:
             # Non-streaming API responses pass through no filter hook, so
             # charge an input estimate now. Web UI calls are excluded: their
             # outlet hook records exact usage once the turn completes.
-            if not streaming and self.valves.estimate_nonstreaming_tokens:
-                metadata = __metadata__ or {}
-                is_web_ui = bool(metadata.get("session_id") or metadata.get("chat_id"))
-                if not is_web_ui:
+            # Streaming requests place a transient hold instead: their exact
+            # usage is recorded when the response completes, which also
+            # releases the hold.
+            metadata = __metadata__ or {}
+            is_web_ui = bool(metadata.get("session_id") or metadata.get("chat_id"))
+            if streaming:
+                if self.valves.hold_credits_at_inlet:
                     estimate = self._estimate_input_tokens(body)
-                    if estimate > 0:
-                        self._record_usage(user_id, model_id, estimate, 0, 0)
+                    hold = self._charge_estimate(estimate)
+                    if hold > 0:
+                        self._place_hold(user_id, model_id, hold)
+            elif self.valves.estimate_nonstreaming_tokens and not is_web_ui:
+                estimate = self._estimate_input_tokens(body)
+                if estimate > 0:
+                    self._record_usage(user_id, model_id, estimate, 0, 0)
 
             if self.valves.cap_max_tokens_to_budget and self._credit_limits_configured():
                 self._cap_max_tokens(body, user_id, model_id)
