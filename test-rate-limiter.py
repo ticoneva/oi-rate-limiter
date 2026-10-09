@@ -50,7 +50,19 @@ def make_filter(**valves):
     f = Filter()
     shared = fakeredis.FakeStrictRedis(decode_responses=True)
     f._redis = shared
-    f.valves = f.Valves(**valves)
+    # Base: neutral weights and all credit limits disabled. Tests that
+    # exercise credit behavior set their own limits; the z.ai Lite plan
+    # defaults live in the Valves class and are covered separately.
+    base = dict(
+        input_weight=1.0,
+        cached_input_weight=1.0,
+        output_weight=1.0,
+        credits_per_minute=None,
+        credits_per_session=None,
+        sliding_window_credits=None,
+    )
+    base.update(valves)
+    f.valves = f.Valves(**base)
     return f
 
 
@@ -563,6 +575,38 @@ body2 = {"stream": True, "messages": [{"role": "user", "content": "a" * 100}]}
 run_inlet(f, body2)
 # remaining = 1000 - 800 - 100 = 100 -> max_tokens = 100
 check("max_tokens cap accounts for sibling holds", body2.get("max_tokens") == 100, body2)
+
+print("== 26. Default valves equal z.ai GLM Coding Plan Lite ==")
+v = Filter.Valves()
+check("credits_per_session default 2000", v.credits_per_session == 2000, v.credits_per_session)
+check("session_window_minutes default 300", v.session_window_minutes == 300, v.session_window_minutes)
+check("sliding_window_credits default 10000", v.sliding_window_credits == 10000, v.sliding_window_credits)
+check("credit_window_minutes default 10080 (7d)", v.credit_window_minutes == 10080, v.credit_window_minutes)
+check("input_weight default 6.9/10000", abs(v.input_weight - 0.00069) < 1e-12, v.input_weight)
+check(
+    "cached_input_weight default 1.7/10000",
+    abs(v.cached_input_weight - 0.00017) < 1e-12,
+    v.cached_input_weight,
+)
+check("output_weight default 24/10000", abs(v.output_weight - 0.0024) < 1e-12, v.output_weight)
+
+# A full z.ai-style request charges the same credits z.ai would.
+f = make_filter()  # base has neutral weights; restore z.ai defaults explicitly
+f.valves = Filter.Valves()
+f2 = make_filter()
+f2.valves.input_weight = 0.00069
+f2.valves.cached_input_weight = 0.00017
+f2.valves.output_weight = 0.0024
+f2.valves.credits_per_session = 2000
+run_stream(f2, vllm_final_chunk_dict(prompt_tokens=100000, completion_tokens=5000, cached_tokens=90000))
+key = [k for k in f2._get_redis().keys() if k.endswith(":credits")][0]
+members = f2._get_redis().zrange(key, 0, -1)
+# z.ai: (10000*6.9 + 90000*1.7 + 5000*24)/10000 = 34.0 credits
+check(
+    "z.ai formula reproduced: 34 credits",
+    members[0].rsplit(":", 1)[1] == "34",
+    members[0],
+)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

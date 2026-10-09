@@ -79,13 +79,13 @@ the same field).
 | `sliding_window_limit` | 100 | Max requests per sliding window |
 | `sliding_window_minutes` | 180 | Request sliding window duration in minutes |
 | `credits_per_minute` | (disabled) | Credit budget per minute per user |
-| `credits_per_session` | (disabled) | Credit budget per session window (z.ai uses 5 hours) |
+| `credits_per_session` | 2000 | Credit budget per session window — z.ai GLM Coding Plan Lite 5-hour allowance |
 | `session_window_minutes` | 300 | Session credit window duration in minutes |
-| `sliding_window_credits` | (disabled) | Credit budget per credit window |
-| `credit_window_minutes` | 1440 | Credit sliding window duration in minutes |
-| `input_weight` | 1.0 | Credit cost of one uncached prefill token |
-| `cached_input_weight` | 1.0 | Credit cost of one cache-hit prefill token |
-| `output_weight` | 1.0 | Credit cost of one decode token |
+| `sliding_window_credits` | 10000 | Credit budget per credit window — z.ai Lite weekly allowance |
+| `credit_window_minutes` | 10080 | Credit sliding window duration in minutes (7 days) |
+| `input_weight` | 0.00069 | Credit cost of one uncached prefill token (z.ai GLM-5.3 input multiplier ÷ 10,000) |
+| `cached_input_weight` | 0.00017 | Credit cost of one cache-hit prefill token (z.ai GLM-5.3 cached multiplier ÷ 10,000) |
+| `output_weight` | 0.0024 | Credit cost of one decode token (z.ai GLM-5.3 output multiplier ÷ 10,000) |
 | `inject_usage_stream_options` | True | Inject `stream_options.include_usage` into streaming requests |
 | `estimate_nonstreaming_tokens` | True | Charge an input estimate for non-streaming API calls |
 | `chars_per_token` | 3.0 | Characters per token for the non-streaming estimate (use ~1.5–2 for CJK-heavy traffic) |
@@ -97,9 +97,14 @@ the same field).
 | `redis_url` | `redis://redis-valkey:6379/0` | Redis connection URL |
 | `rate_limiter_id` | (empty) | Namespace for this limiter; leave empty to use the model ID, or set the same ID on multiple instances to share a combined budget |
 
-Deploying the filter with default valves is a behavioral no-op for credits:
-all credit limits are disabled and all weights neutral, so existing
-request-limiting behavior is unchanged until a credit limit is set.
+Deploying the filter with default valves enforces z.ai's GLM Coding Plan
+**Lite** allowances (2,000 credits per 5 hours, 10,000 per week, GLM-5.3
+multipliers) — one credit unit equals one z.ai credit. For the Pro plan
+($80/mo), set `credits_per_session: 12000` and `sliding_window_credits:
+60000`; for Lite's weights on GLM-5.3-Flash, set the multipliers to
+2.3/0.56/8 (÷10,000). Request-count limits remain on top of the credit
+budgets and may need loosening (the defaults, 10/minute and 100/3h, are
+stricter than z.ai's plan semantics).
 
 ## Redis layout
 

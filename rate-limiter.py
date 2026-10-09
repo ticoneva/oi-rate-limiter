@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.6.0
+version: 0.7.0
 license: MIT
 """
 
@@ -42,10 +42,10 @@ class Filter:
             ),
         )
         credits_per_session: Optional[int] = Field(
-            default=None,
+            default=2000,
             description=(
-                "Credit budget per session window per user (z.ai uses a 5-hour "
-                "window). None disables this period."
+                "Credit budget per session window per user. Defaults to z.ai's "
+                "GLM Coding Plan Lite 5-hour allowance (2,000 credits)."
             ),
         )
         session_window_minutes: int = Field(
@@ -53,31 +53,40 @@ class Filter:
             description="Duration of the session credit window in minutes.",
         )
         sliding_window_credits: Optional[int] = Field(
-            default=None,
+            default=10000,
             description=(
-                "Credit budget within the credit sliding window. None disables this period."
+                "Credit budget within the credit sliding window. Defaults to "
+                "z.ai's GLM Coding Plan Lite weekly allowance (10,000 credits)."
             ),
         )
         credit_window_minutes: int = Field(
-            default=1440,
+            default=10080,
             description="Duration of the credit sliding window in minutes.",
         )
         input_weight: float = Field(
-            default=1.0,
-            description="Credit cost of one uncached prefill (input) token.",
+            default=0.00069,
+            description=(
+                "Credit cost of one uncached prefill (input) token. Default is "
+                "z.ai's GLM-5.3 input multiplier (6.9) / 10,000, so one unit "
+                "equals one z.ai credit."
+            ),
         )
         cached_input_weight: float = Field(
-            default=1.0,
+            default=0.00017,
             description=(
                 "Credit cost of one cache-hit prefill token (vLLM prefix cache and "
-                "LMCache hits). Set below 1.0 to discount cache hits; requires vLLM "
-                "started with --enable-prompt-tokens-details. Falls back to full "
-                "input cost when the backend does not report cached_tokens."
+                "LMCache hits). Default is z.ai's GLM-5.3 cached-input multiplier "
+                "(1.7) / 10,000. Requires vLLM started with "
+                "--enable-prompt-tokens-details; falls back to full input cost when "
+                "the backend does not report cached_tokens."
             ),
         )
         output_weight: float = Field(
-            default=1.0,
-            description="Credit cost of one decode (output) token.",
+            default=0.0024,
+            description=(
+                "Credit cost of one decode (output) token. Default is z.ai's "
+                "GLM-5.3 output multiplier (24) / 10,000."
+            ),
         )
         inject_usage_stream_options: bool = Field(
             default=True,
