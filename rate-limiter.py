@@ -1,14 +1,16 @@
 """
-title: Rate Limit Filter
+title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.4.0
+version: 0.5.0
 license: MIT
 """
 
+import json
 import time
 import uuid
+from datetime import datetime, timedelta
 from typing import Callable, Awaitable, Any, Optional, Tuple
 from pydantic import BaseModel, Field
 
@@ -31,6 +33,74 @@ class Filter:
         sliding_window_minutes: Optional[int] = Field(
             default=180, description="Duration of the sliding window in minutes."
         )
+        credits_per_minute: Optional[int] = Field(
+            default=None,
+            description=(
+                "Credit budget per minute per user. Credits are weighted tokens: "
+                "input_weight x uncached prefill + cached_input_weight x cached prefill "
+                "+ output_weight x decode. None disables this period."
+            ),
+        )
+        credits_per_hour: Optional[int] = Field(
+            default=None,
+            description="Credit budget per hour per user. None disables this period.",
+        )
+        sliding_window_credits: Optional[int] = Field(
+            default=None,
+            description=(
+                "Credit budget within the credit sliding window. None disables this period."
+            ),
+        )
+        credit_window_minutes: int = Field(
+            default=1440,
+            description="Duration of the credit sliding window in minutes.",
+        )
+        input_weight: float = Field(
+            default=1.0,
+            description="Credit cost of one uncached prefill (input) token.",
+        )
+        cached_input_weight: float = Field(
+            default=1.0,
+            description=(
+                "Credit cost of one cache-hit prefill token (vLLM prefix cache and "
+                "LMCache hits). Set below 1.0 to discount cache hits; requires vLLM "
+                "started with --enable-prompt-tokens-details. Falls back to full "
+                "input cost when the backend does not report cached_tokens."
+            ),
+        )
+        output_weight: float = Field(
+            default=1.0,
+            description="Credit cost of one decode (output) token.",
+        )
+        inject_usage_stream_options: bool = Field(
+            default=True,
+            description=(
+                "Inject stream_options.include_usage into streaming requests so "
+                "OpenAI-compatible backends report token usage in the final chunk."
+            ),
+        )
+        estimate_nonstreaming_tokens: bool = Field(
+            default=True,
+            description=(
+                "Charge an input-token estimate for non-streaming API calls, whose "
+                "responses are not visible to any filter hook."
+            ),
+        )
+        chars_per_token: float = Field(
+            default=3.0,
+            description=(
+                "Characters per token used for the non-streaming estimate. "
+                "Use ~1.5-2 for CJK-heavy traffic."
+            ),
+        )
+        cap_max_tokens_to_budget: bool = Field(
+            default=False,
+            description=(
+                "Clamp the request's max_tokens to the remaining credit budget "
+                "divided by output_weight, bounding overshoot on the final request "
+                "before a limit is hit."
+            ),
+        )
         enabled_for_admins: bool = Field(
             default=True,
             description="Whether rate limiting is enabled for admin users.",
@@ -43,7 +113,9 @@ class Filter:
             default="",
             description=(
                 "Optional namespace for this rate limiter. If empty, the model ID is used automatically. "
-                "Set the same ID on multiple rate-limiter instances to share tracking (global limiting)."
+                "Set the same ID on multiple rate-limiter instances to share tracking (global limiting). "
+                "Credit records store the charge computed with each instance's own weights, "
+                "so models with different weights can share one credit budget correctly."
             ),
         )
 
@@ -62,13 +134,22 @@ class Filter:
     def _make_key(namespace: str, user_id: str) -> str:
         return f"oi-rate-limiter:{namespace}:{user_id}"
 
+    @staticmethod
+    def _credit_key(namespace: str, user_id: str) -> str:
+        return f"oi-rate-limiter:{namespace}:{user_id}:credits"
+
+    @staticmethod
+    def _done_marker_key(
+        namespace: str, user_id: str, chat_id: str, message_id: str
+    ) -> str:
+        return f"oi-rate-limiter:{namespace}:{user_id}:done:{chat_id}:{message_id}"
+
     def _get_namespace(self, model_id: str) -> str:
         ns = self.valves.rate_limiter_id.strip()
         return ns if ns else model_id
 
-    def _prune_key(self, key: str, now: float):
-        cutoff = now - self.valves.sliding_window_minutes * 60
-        self._get_redis().zremrangebyscore(key, "-inf", cutoff)
+    def _prune_key(self, key: str, now: float, window_secs: float):
+        self._get_redis().zremrangebyscore(key, "-inf", now - window_secs)
 
     def _count_key(self, key: str, start: float, end: float) -> int:
         return self._get_redis().zcount(key, start, end)
@@ -91,7 +172,7 @@ class Filter:
         now = time.time()
 
         # Prune expired entries outside the sliding window
-        self._prune_key(key, now)
+        self._prune_key(key, now, self.valves.sliding_window_minutes * 60)
 
         # Check per-minute limit
         if self.valves.requests_per_minute is not None:
@@ -108,13 +189,188 @@ class Filter:
                 return True, int(3600 - (now - earliest)), count
 
         # Check sliding window limit
-        slide_secs = self.valves.sliding_window_minutes * 60
-        count = self._count_key(key, now - slide_secs, "+inf")
-        if count >= self.valves.sliding_window_limit:
-            earliest = self._earliest_key(key, now - slide_secs, "+inf")
-            return True, int(slide_secs - (now - earliest)), count
+        if self.valves.sliding_window_limit is not None:
+            slide_secs = self.valves.sliding_window_minutes * 60
+            count = self._count_key(key, now - slide_secs, "+inf")
+            if count >= self.valves.sliding_window_limit:
+                earliest = self._earliest_key(key, now - slide_secs, "+inf")
+                return True, int(slide_secs - (now - earliest)), count
 
         return False, None, 0
+
+    def _credit_limits_configured(self) -> bool:
+        return any(
+            v is not None
+            for v in (
+                self.valves.credits_per_minute,
+                self.valves.credits_per_hour,
+                self.valves.sliding_window_credits,
+            )
+        )
+
+    def _credit_retention_secs(self) -> int:
+        """Records are kept at least as long as the longest active window."""
+        retention = self.valves.credit_window_minutes * 60
+        if self.valves.credits_per_minute is not None:
+            retention = max(retention, 60)
+        if self.valves.credits_per_hour is not None:
+            retention = max(retention, 3600)
+        return retention
+
+    def _sum_credits(self, key: str, start: float, end: float) -> int:
+        # Members are "{ts}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}"
+        total = 0
+        for member in self._get_redis().zrangebyscore(key, start, end):
+            try:
+                total += int(float(member.rsplit(":", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+        return total
+
+    def credit_limited(
+        self, user_id: str, model_id: str
+    ) -> Tuple[bool, Optional[int], int, Optional[int]]:
+        """Returns (limited, wait_seconds, used, limit) where (used, limit)
+        describe the window closest to its limit, even when not limited."""
+        namespace = self._get_namespace(model_id)
+        key = self._credit_key(namespace, user_id)
+        now = time.time()
+        window_secs = self.valves.credit_window_minutes * 60
+
+        self._prune_key(key, now, window_secs)
+
+        best_used, best_limit = 0, None
+        best_ratio = -1.0
+        for limit, win_secs in (
+            (self.valves.credits_per_minute, 60),
+            (self.valves.credits_per_hour, 3600),
+            (self.valves.sliding_window_credits, window_secs),
+        ):
+            if limit is None:
+                continue
+            used = self._sum_credits(key, now - win_secs, "+inf")
+            if used >= limit:
+                earliest = self._earliest_key(key, now - win_secs, "+inf")
+                wait = int(win_secs - (now - (earliest if earliest else now)))
+                return True, wait, used, limit
+            ratio = used / limit
+            if ratio > best_ratio:
+                best_ratio, best_used, best_limit = ratio, used, limit
+
+        return False, None, best_used, best_limit
+
+    def _remaining_credits(self, user_id: str, model_id: str) -> Optional[int]:
+        namespace = self._get_namespace(model_id)
+        key = self._credit_key(namespace, user_id)
+        now = time.time()
+        window_secs = self.valves.credit_window_minutes * 60
+
+        remaining = None
+        for limit, win_secs in (
+            (self.valves.credits_per_minute, 60),
+            (self.valves.credits_per_hour, 3600),
+            (self.valves.sliding_window_credits, window_secs),
+        ):
+            if limit is None:
+                continue
+            room = limit - self._sum_credits(key, now - win_secs, "+inf")
+            if remaining is None or room < remaining:
+                remaining = room
+        return remaining
+
+    def _record_usage(
+        self,
+        user_id: str,
+        model_id: str,
+        input_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+    ) -> int:
+        namespace = self._get_namespace(model_id)
+        key = self._credit_key(namespace, user_id)
+
+        cached = max(0, min(int(cached_tokens), int(input_tokens)))
+        uncached = max(0, int(input_tokens) - cached)
+        output = max(0, int(output_tokens))
+
+        # Charge with this instance's weights at write time, so models with
+        # different pricing can share one credit budget via rate_limiter_id.
+        charged = round(
+            self.valves.input_weight * uncached
+            + self.valves.cached_input_weight * cached
+            + self.valves.output_weight * output
+        )
+
+        score = time.time()
+        member = f"{score}:{uuid.uuid4().hex}:{uncached}:{cached}:{output}:{charged}"
+
+        r = self._get_redis()
+        with r.pipeline() as pipe:
+            pipe.zadd(key, {member: score})
+            pipe.expire(key, self._credit_retention_secs())
+            pipe.execute()
+        return charged
+
+    @staticmethod
+    def _extract_usage(usage: Any) -> Tuple[int, int, int]:
+        """Return (input_tokens, cached_tokens, output_tokens) from a usage
+        object in any of the formats Open WebUI passes through: raw OpenAI
+        (prompt_tokens/prompt_tokens_details), normalized Open WebUI
+        (input_tokens/output_tokens), Ollama (prompt_eval_count/eval_count),
+        or Responses API (nested under response.usage)."""
+        if not isinstance(usage, dict):
+            return 0, 0, 0
+
+        input_tokens = (
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or usage.get("prompt_eval_count")
+            or usage.get("prompt_n")
+            or 0
+        )
+        output_tokens = (
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or usage.get("eval_count")
+            or usage.get("predicted_n")
+            or 0
+        )
+        details = usage.get("prompt_tokens_details")
+        cached = (details.get("cached_tokens") if isinstance(details, dict) else 0) or 0
+
+        try:
+            return int(input_tokens), int(cached), int(output_tokens)
+        except (TypeError, ValueError):
+            return 0, 0, 0
+
+    def _estimate_input_tokens(self, body: dict) -> int:
+        chars = 0
+        for message in body.get("messages", []):
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        chars += len(part.get("text") or "")
+        divisor = self.valves.chars_per_token or 3.0
+        return int(chars / divisor)
+
+    def _cap_max_tokens(self, body: dict, user_id: str, model_id: str):
+        remaining = self._remaining_credits(user_id, model_id)
+        if remaining is None or self.valves.output_weight <= 0:
+            return
+        allowed = max(1, int(remaining / self.valves.output_weight))
+        capped = False
+        for field in ("max_tokens", "max_completion_tokens"):
+            current = body.get(field)
+            if isinstance(current, (int, float)) and current > allowed:
+                body[field] = allowed
+                capped = True
+        if not capped and "max_tokens" not in body and "max_completion_tokens" not in body:
+            body["max_tokens"] = allowed
 
     def log_request(self, user_id: str, model_id: str):
         namespace = self._get_namespace(model_id)
@@ -129,36 +385,194 @@ class Filter:
             pipe.expire(key, self.valves.sliding_window_minutes * 60)
             pipe.execute()
 
+    @staticmethod
+    def _retry_time(wait_seconds: int) -> str:
+        future_time = datetime.now() + timedelta(seconds=wait_seconds)
+        return future_time.strftime("%I:%M %p")
+
+    def _enforced_for(self, __user__: Optional[dict]) -> bool:
+        return __user__ is not None and (
+            __user__.get("role") != "admin" or self.valves.enabled_for_admins
+        )
+
     def inlet(
         self,
         body: dict,
         __event_emitter__: Callable[[Any], Awaitable[None]],
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
     ) -> dict:
-        print(f"inlet:{__name__}")
-        print(f"inlet:body:{body}")
-        print(f"inlet:user:{__user__}")
-
-        if __user__ is not None and (
-            __user__.get("role") != "admin" or self.valves.enabled_for_admins
-        ):
+        if self._enforced_for(__user__):
             user_id = __user__["id"]
             model_id = __model__["id"] if __model__ is not None else "default_model"
+
             rate_limited, wait_time, request_count = self.rate_limited(
                 user_id, model_id
             )
             if rate_limited:
-                from datetime import datetime, timedelta
-
-                current_time = datetime.now()
-                future_time = current_time + timedelta(seconds=wait_time)
-                future_time_str = future_time.strftime("%I:%M %p")
-
                 raise Exception(
-                    f"Rate limit exceeded. You have made {request_count} requests to model '{model_id}'. Please try again at {future_time_str}."
+                    f"Rate limit exceeded. You have made {request_count} requests to model '{model_id}'. Please try again at {self._retry_time(wait_time)}."
                 )
 
+            if self._credit_limits_configured():
+                credit_limited, credit_wait, used_credits, credit_limit = (
+                    self.credit_limited(user_id, model_id)
+                )
+                if credit_limited:
+                    raise Exception(
+                        f"Credit limit exceeded. You have used {used_credits} of {credit_limit} credits on model '{model_id}'. Please try again at {self._retry_time(credit_wait)}."
+                    )
+
             self.log_request(user_id, model_id)
+
+            streaming = bool(body.get("stream"))
+
+            # Ask OpenAI-compatible backends to report token usage in the
+            # final stream chunk. The Ollama converter drops this field
+            # harmlessly; Ollama reports usage regardless. A client-supplied
+            # stream_options is left alone — it controls this already.
+            if streaming and self.valves.inject_usage_stream_options:
+                if not isinstance(body.get("stream_options"), dict):
+                    body["stream_options"] = {"include_usage": True}
+                else:
+                    body["stream_options"].setdefault("include_usage", True)
+
+            # Non-streaming API responses pass through no filter hook, so
+            # charge an input estimate now. Web UI calls are excluded: their
+            # outlet hook records exact usage once the turn completes.
+            if not streaming and self.valves.estimate_nonstreaming_tokens:
+                metadata = __metadata__ or {}
+                is_web_ui = bool(metadata.get("session_id") or metadata.get("chat_id"))
+                if not is_web_ui:
+                    estimate = self._estimate_input_tokens(body)
+                    if estimate > 0:
+                        self._record_usage(user_id, model_id, estimate, 0, 0)
+
+            if self.valves.cap_max_tokens_to_budget and self._credit_limits_configured():
+                self._cap_max_tokens(body, user_id, model_id)
+
+        return body
+
+    async def stream(
+        self,
+        event: Any,
+        __user__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+    ) -> Any:
+        """Record actual token usage from usage-bearing stream chunks.
+
+        The web UI path delivers each chunk as a parsed dict; the API path
+        (no websocket session) delivers raw SSE lines. The event is always
+        returned unmodified — bytes and framing must reach the client intact.
+        """
+        if not self._credit_limits_configured() or not self._enforced_for(__user__):
+            return event
+
+        if isinstance(event, dict):
+            usage = event.get("usage")
+            if usage is None:
+                response = event.get("response")
+                if isinstance(response, dict):
+                    usage = response.get("usage")  # Responses API events
+        elif isinstance(event, (str, bytes)):
+            text = (
+                event.decode("utf-8", "replace")
+                if isinstance(event, bytes)
+                else event
+            )
+            usage = None
+            stripped = text.strip()
+            if stripped.startswith("data:"):
+                payload = stripped[len("data:") :].strip()
+                if payload and payload != "[DONE]":
+                    try:
+                        data = json.loads(payload)
+                    except json.JSONDecodeError:
+                        data = None
+                    if isinstance(data, dict):
+                        usage = data.get("usage")
+                        if usage is None:
+                            response = data.get("response")
+                            if isinstance(response, dict):
+                                usage = response.get("usage")
+        else:
+            return event
+
+        if usage is None:
+            return event
+
+        input_tokens, cached_tokens, output_tokens = self._extract_usage(usage)
+        if input_tokens <= 0 and output_tokens <= 0:
+            return event
+
+        user_id = __user__["id"]
+        model_id = __model__["id"] if __model__ is not None else "default_model"
+        try:
+            self._record_usage(user_id, model_id, input_tokens, cached_tokens, output_tokens)
+
+            # Mark this chat turn as accounted, so the outlet hook (which
+            # fires after streaming turns too) does not double-charge it.
+            metadata = __metadata__ or {}
+            chat_id = metadata.get("chat_id")
+            message_id = metadata.get("message_id")
+            if chat_id and message_id:
+                marker = self._done_marker_key(
+                    self._get_namespace(model_id), user_id, chat_id, message_id
+                )
+                self._get_redis().set(marker, "1", ex=900)
+        except Exception as e:
+            print(f"rate-limiter: failed to record stream usage: {e}")
+
+        return event
+
+    async def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
+    ) -> dict:
+        """Record exact usage for non-streaming web UI turns, as a fallback
+        for turns the stream hook did not already account for."""
+        if not self._credit_limits_configured() or not self._enforced_for(__user__):
+            return body
+
+        user_id = __user__["id"]
+        model_id = (__model__ or {}).get("id") or body.get("model") or "default_model"
+        namespace = self._get_namespace(model_id)
+
+        chat_id = body.get("chat_id")
+        message_id = body.get("id")
+        if chat_id and message_id:
+            try:
+                if self._get_redis().exists(
+                    self._done_marker_key(namespace, user_id, chat_id, message_id)
+                ):
+                    return body
+            except Exception:
+                return body
+
+        usage = body.get("usage")
+        if not usage:
+            for message in reversed(body.get("messages", [])):
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and message.get("usage")
+                ):
+                    usage = message["usage"]
+                    break
+        if not usage:
+            return body
+
+        input_tokens, cached_tokens, output_tokens = self._extract_usage(usage)
+        if input_tokens <= 0 and output_tokens <= 0:
+            return body
+
+        try:
+            self._record_usage(user_id, model_id, input_tokens, cached_tokens, output_tokens)
+        except Exception as e:
+            print(f"rate-limiter: failed to record outlet usage: {e}")
 
         return body
