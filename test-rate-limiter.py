@@ -73,13 +73,15 @@ def user(uid="u1", role="user"):
 MODEL = {"id": "glm-5.3", "info": {}}
 
 
-def run_inlet(f, body, metadata=None, model=MODEL, u=None):
-    return f.inlet(
-        body,
-        TestEventEmitter(),
-        __user__=u or user(),
-        __model__=model,
-        __metadata__=metadata or {},
+def run_inlet(f, body, metadata=None, model=MODEL, u=None, emitter=None):
+    return asyncio.run(
+        f.inlet(
+            body,
+            emitter if emitter is not None else TestEventEmitter(),
+            __user__=u or user(),
+            __model__=model,
+            __metadata__=metadata or {},
+        )
     )
 
 
@@ -607,6 +609,113 @@ check(
     members[0].rsplit(":", 1)[1] == "34",
     members[0],
 )
+
+print("== 27. Usage status display ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000, sliding_window_credits=10000,
+    show_usage_status=True, chars_per_token=1.0,
+)
+emitter = TestEventEmitter()
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]}, emitter=emitter)
+status_events = [e for e in emitter.events if e.get("type") == "status"]
+check("status emitted at inlet", len(status_events) == 1, emitter.events)
+desc = status_events[0]["data"]["description"] if status_events else ""
+# Status shows where the user stands before this request's hold is placed.
+check(
+    "first request status starts at zero",
+    desc == "Credits: 0/2.0K session (0%) - 0/10K week (0%)",
+    desc,
+)
+check("status event marked done", status_events and status_events[0]["data"].get("done") is True)
+
+# after usage records, a new inlet shows updated numbers
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=200, completion_tokens=100))  # 300 exact
+emitter2 = TestEventEmitter()
+run_inlet(f, {"stream": True, "messages": []}, emitter=emitter2)
+desc2 = [e for e in emitter2.events if e.get("type") == "status"][0]["data"]["description"]
+check(
+    "status reflects recorded usage after completion",
+    desc2 == "Credits: 300/2.0K session (15%) - 300/10K week (3%)",
+    desc2,
+)
+
+print("== 28. Status off by default / per-user opt-out ==")
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000,
+)
+emitter = TestEventEmitter()
+run_inlet(f, {"stream": True, "messages": []}, emitter=emitter)
+check(
+    "no status when valve off",
+    not [e for e in emitter.events if e.get("type") == "status"],
+    emitter.events,
+)
+
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000, show_usage_status=True,
+)
+# user valve opt-out: __user__["valves"].show_usage_status = False
+class UserValvesStub:
+    show_usage_status = False
+
+emitter = TestEventEmitter()
+run_inlet(
+    f, {"stream": True, "messages": []}, emitter=emitter,
+    u={"id": "u1", "role": "user", "valves": UserValvesStub()},
+)
+check(
+    "user opt-out suppresses status",
+    not [e for e in emitter.events if e.get("type") == "status"],
+    emitter.events,
+)
+
+# outlet emits refreshed status after recording
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000, show_usage_status=True,
+)
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=50))  # 150
+emitter = TestEventEmitter()
+asyncio.run(
+    f.outlet(
+        {
+            "model": "glm-5.3",
+            "chat_id": "c9",
+            "id": "m9",
+            "messages": [
+                {
+                    "id": "m9",
+                    "role": "assistant",
+                    "content": "x",
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                }
+            ],
+        },
+        __event_emitter__=emitter,
+        __user__=user(),
+        __model__=MODEL,
+    )
+)
+statuses = [e for e in emitter.events if e.get("type") == "status"]
+check("outlet emits refreshed status", len(statuses) == 1, emitter.events)
+if statuses:
+    check(
+        "outlet status includes new record",
+        "300/2.0K session" in statuses[0]["data"]["description"],
+        statuses[0]["data"]["description"],
+    )
+
+# large numbers format as K
+f = make_filter(
+    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
+    credits_per_session=2000, show_usage_status=True, chars_per_token=1.0,
+)
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=1500, completion_tokens=0))
+msg = f._usage_status_message("u1", "glm-5.3")
+check("K formatting", msg.startswith("Credits: 1.5K/2.0K session (75%)"), msg)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

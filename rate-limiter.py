@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.7.0
+version: 0.8.0
 license: MIT
 """
 
@@ -143,6 +143,15 @@ class Filter:
                 "duration."
             ),
         )
+        show_usage_status: bool = Field(
+            default=False,
+            description=(
+                "Emit a status event at request time showing the user's current "
+                "credit consumption for the session and sliding windows, e.g. "
+                "'Credits: 340/2000 session (17%) - 4210/10000 week (42%)'. "
+                "Visible in the web UI; API clients ignore status events."
+            ),
+        )
         enabled_for_admins: bool = Field(
             default=True,
             description="Whether rate limiting is enabled for admin users.",
@@ -159,6 +168,13 @@ class Filter:
                 "Credit records store the charge computed with each instance's own weights, "
                 "so models with different weights can share one credit budget correctly."
             ),
+        )
+
+    class UserValves(BaseModel):
+        show_usage_status: bool = Field(
+            default=True,
+            description="Show the credit usage status line on your requests. "
+            "Limit enforcement is unaffected.",
         )
 
     def __init__(self):
@@ -492,7 +508,70 @@ class Filter:
             __user__.get("role") != "admin" or self.valves.enabled_for_admins
         )
 
-    def inlet(
+    @staticmethod
+    def _fmt_credits(n: float) -> str:
+        if n >= 100000:
+            return f"{n / 1000000:.1f}M"
+        if n >= 10000:
+            return f"{n / 1000:.0f}K"
+        if n >= 1000:
+            return f"{n / 1000:.1f}K"
+        return f"{n:.0f}"
+
+    def _usage_status_message(self, user_id: str, model_id: str) -> str:
+        now = time.time()
+        parts = []
+        for label, limit, win_secs in (
+            (
+                "session",
+                self.valves.credits_per_session,
+                self.valves.session_window_minutes * 60,
+            ),
+            (
+                "week",
+                self.valves.sliding_window_credits,
+                self.valves.credit_window_minutes * 60,
+            ),
+        ):
+            if limit is None:
+                continue
+            used, _ = self._used_with_holds(user_id, model_id, now, win_secs)
+            pct = (used / limit * 100) if limit > 0 else 0
+            parts.append(
+                f"{self._fmt_credits(used)}/{self._fmt_credits(limit)} {label} ({pct:.0f}%)"
+            )
+        if not parts:
+            return "Credits: no limits configured"
+        return f"Credits: {' - '.join(parts)}"
+
+    async def _emit_usage_status(
+        self,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]],
+        __user__: dict,
+        user_id: str,
+        model_id: str,
+    ):
+        if __event_emitter__ is None:
+            return
+        user_valves = __user__.get("valves")
+        if user_valves is not None and not getattr(
+            user_valves, "show_usage_status", True
+        ):
+            return
+        try:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": self._usage_status_message(user_id, model_id),
+                        "done": True,
+                    },
+                }
+            )
+        except Exception as e:
+            print(f"rate-limiter: failed to emit usage status: {e}")
+
+    async def inlet(
         self,
         body: dict,
         __event_emitter__: Callable[[Any], Awaitable[None]],
@@ -522,6 +601,11 @@ class Filter:
                     )
 
             self.log_request(user_id, model_id)
+
+            if self.valves.show_usage_status:
+                await self._emit_usage_status(
+                    __event_emitter__, __user__, user_id, model_id
+                )
 
             streaming = bool(body.get("stream"))
 
@@ -635,6 +719,7 @@ class Filter:
     async def outlet(
         self,
         body: dict,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
@@ -679,5 +764,10 @@ class Filter:
             self._record_usage(user_id, model_id, input_tokens, cached_tokens, output_tokens)
         except Exception as e:
             print(f"rate-limiter: failed to record outlet usage: {e}")
+
+        if self.valves.show_usage_status:
+            await self._emit_usage_status(
+                __event_emitter__, __user__, user_id, model_id
+            )
 
         return body
