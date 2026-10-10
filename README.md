@@ -193,6 +193,28 @@ pip install redis
 4. Optional, for cache-hit discounts: restart vLLM with
    `--enable-prompt-tokens-details` and set `cached_input_weight` below 1.0.
 
+## Admin tool
+
+`credit-admin-tool.py` is a companion Open WebUI **tool** (not a filter) for
+administrators. It reads the same Redis data the filter writes, so point its
+`redis_url` at the same instance.
+
+- **`query_credit_usage(user, namespace="")`** — per-namespace summary of a
+  user's consumption: total charged, token split (uncached/cached input,
+  output, cache-hit rate), and credit totals for the session (5h), weekly,
+  and all-time windows. `user` accepts a user ID, email, or name.
+- **`clear_credit_usage(user, namespace="", confirm=false)`** — deletes the
+  user's credit records (and pending holds) for one namespace or all,
+  resetting their budget. Requires `confirm=true` to act, so a model
+  misunderstanding cannot wipe data; an un-namespaced clear also sweeps
+  request-count keys so rate limits unblock too.
+
+Both operations are restricted to users with the `admin` role — non-admins
+get an error string, and all Redis failures return as error messages rather
+than exceptions. Being a tool, it is invoked by the model when an admin asks
+in chat ("how many credits has Alice used this week?"); give the model the
+tool via Workspace → Tools, and restrict its access to admins.
+
 ## Testing
 
 `test-rate-limiter.py` runs the filter against `fakeredis` with all three
@@ -202,6 +224,7 @@ shared-state multi-instance scenarios:
 ```bash
 pip install --user fakeredis pydantic
 python3 test-rate-limiter.py
+python3 test-credit-admin-tool.py
 ```
 
 ## License
