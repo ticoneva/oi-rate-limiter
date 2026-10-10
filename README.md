@@ -3,6 +3,42 @@
 A filter for [Open WebUI](https://github.com/open-webui/open-webui) that enforces
 per-user request rate limits and credit budgets (weighted token limits).
 
+## How many credits does my usage cost?
+
+With the default (z.ai GLM Coding Plan Lite) weights, every **10,000 tokens** consumed costs:
+
+| What | Credits |
+|---|---|
+| Input the model reads for the **first time** | **6.9** |
+| Input served from **cache** (prefix cache / LMCache hits) | **1.7** |
+| Output the model **writes** — *including thinking* | **24** |
+
+Equivalently, one credit buys ~1,450 fresh input tokens, ~5,900 cached
+input tokens, or ~420 output tokens.
+
+Rules of thumb:
+
+1. **Output costs 3.5× input, thinking included.** A long reasoning trace
+   before a short answer can cost more than the question's context.
+2. **Continuing a conversation is much cheaper than starting one** —
+   repeated history hits cache (1.7 vs 6.9 per 10K tokens).
+3. **Budgets in plain terms**: the 2,000-credit session is ~830K output
+   tokens or ~2.9M fresh input tokens; the 10,000-credit week is ~4.2M
+   output or ~14.5M fresh input tokens.
+
+Typical coding scenarios:
+
+| Scenario | ~Credits |
+|---|---|
+| Quick chat question (few hundred tokens) | 0 (rounds away) |
+| One coding exchange in a warm session (10K cached context + 800 output) | 3–4 |
+| Fresh 100K-token context (new repo, first read) | ~70 |
+| Heavy agentic hour (~150 calls × 8 credits) | ~1,200 |
+
+So the session budget supports roughly 1.5–2 hours of full-speed agentic
+coding per 5-hour window, and the weekly budget 8–9 hours of it — before
+cache hits, which in practice stretch it considerably.
+
 ## Why Redis?
 
 Open WebUI can run with **multiple workers**, each handling requests independently. A rate limiter that stores counts in memory (e.g. a Python `dict`) only knows about the requests it has personally seen. The same user hitting two different workers would never exceed the limit, even though they've made twice as many requests.
