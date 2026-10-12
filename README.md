@@ -195,25 +195,46 @@ pip install redis
 
 ## Admin tool
 
-`credit-admin-tool.py` is a companion Open WebUI **tool** (not a filter) for
-administrators. It reads the same Redis data the filter writes, so point its
-`redis_url` at the same instance.
+`credit-admin-tool.py` is a companion Open WebUI **tool** (not a filter). It
+reads the same Redis data the filter writes, so point its `redis_url` at the
+same instance.
 
-- **`query_credit_usage(user, namespace="")`** — per-namespace summary of a
-  user's consumption: total charged, token split (uncached/cached input,
+- **`query_credit_usage(user="", namespace="")`** — per-namespace summary of
+  a user's consumption: total charged, token split (uncached/cached input,
   output, cache-hit rate), and credit totals for the session (5h), weekly,
-  and all-time windows. `user` accepts a user ID, email, or name.
-- **`clear_credit_usage(user, namespace="", confirm=false)`** — deletes the
-  user's credit records (and pending holds) for one namespace or all,
-  resetting their budget. Requires `confirm=true` to act, so a model
+  and all-time windows. `user` accepts a user ID, email, or name. Names are
+  resolved case-insensitively; an exact name match wins over substring
+  siblings, and a name matching multiple users returns an error listing the
+  candidates instead of guessing.
+- **`adjust_credit_usage(user, amount, reason="", namespace="", confirm=false)`** —
+  admin-only. Grants (positive) or deducts (negative) credits by appending a
+  signed manual-adjustment record to the same credit ledger the filter sums.
+  The user's remaining budget changes immediately; the record keeps a
+  sanitized copy of `reason` and shows up in usage reports as a "manual
+  adjustments" line. Scoped to one namespace or all of the user's namespaces.
+- **`clear_credit_usage(user, namespace="", confirm=false)`** — admin-only.
+  Deletes the user's credit records (and pending holds) for one namespace or
+  all, resetting their budget. Requires `confirm=true` to act, so a model
   misunderstanding cannot wipe data; an un-namespaced clear also sweeps
   request-count keys so rate limits unblock too.
 
-Both operations are restricted to users with the `admin` role — non-admins
-get an error string, and all Redis failures return as error messages rather
-than exceptions. Being a tool, it is invoked by the model when an admin asks
-in chat ("how many credits has Alice used this week?"); give the model the
-tool via Workspace → Tools, and restrict its access to admins.
+Permissions: **admins** may query, adjust, and clear anyone's usage (an empty
+`user` means themselves). **Everyone else** may only **query their own**
+usage — leave `user` empty (or pass their own ID); naming any other account
+is refused without confirming whether it exists. `adjust` and `clear` are
+admin-only in all cases.
+
+All failures return as error messages rather than exceptions. Being a tool,
+it is invoked by the model when someone asks in chat ("how many credits do I
+have left?" / "how many credits has Alice used this week?"); give the model
+the tool via Workspace → Tools. Restrict tool access to admins if you don't
+want regular users asking about their own usage via chat, or leave it
+accessible to let users self-serve.
+
+User lookup works against both Open WebUI generations — the sync user
+repository of v0.8.x and the async one of v0.9+ — and any backend lookup
+failure is returned as an error message rather than silently querying Redis
+with an unresolved name.
 
 ## Testing
 
