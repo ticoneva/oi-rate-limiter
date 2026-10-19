@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 1.1.0
+version: 1.1.1
 license: MIT
 """
 
@@ -180,8 +180,8 @@ class Filter:
             default=True,
             description="Whether rate limiting is enabled for admin users.",
         )
-        status_unit: StatusUnit = Field(
-            default=StatusUnit.CREDITS_2DP,
+        status_unit: str = Field(
+            default="credits",
             description=(
                 "Unit and precision of the credits shown in the usage status "
                 "line. credits: whole credits (2 decimals below 100). "
@@ -189,6 +189,16 @@ class Filter:
                 "short prompt's effect. raw: the internal fractional credit "
                 "value without rounding."
             ),
+            # Open WebUI's valve editor renders a dropdown from this
+            # json_schema_extra config — a pydantic Enum does NOT work: it
+            # serializes as a $ref with no inline enum/title, which the
+            # editor shows as an untitled text box.
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": ["credits", "milli-credits", "raw"],
+                }
+            },
         )
         redis_url: str = Field(
             default="redis://redis-valkey:6379/0",
@@ -210,13 +220,19 @@ class Filter:
             description="Show the credit usage status line on your requests. "
             "Limit enforcement is unaffected.",
         )
-        status_unit: StatusUnit = Field(
-            default=StatusUnit.CREDITS_2DP,
+        status_unit: str = Field(
+            default="credits",
             description=(
                 "Unit shown in your usage status line: credits, "
                 "milli-credits (thousandths — one short prompt is visible), "
                 "or the raw fractional value."
             ),
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": ["credits", "milli-credits", "raw"],
+                }
+            },
         )
 
     def __init__(self):
@@ -658,7 +674,11 @@ class Filter:
         unit: Optional["StatusUnit"] = None,
     ) -> str:
         if unit is None:
-            unit = self.valves.status_unit
+            # The valve is a plain string (dropdown-rendered); parse it.
+            try:
+                unit = StatusUnit(self.valves.status_unit)
+            except ValueError:
+                unit = StatusUnit.CREDITS_2DP
         now = time.time()
         parts = []
         for label, limit, win_secs in (
@@ -740,8 +760,9 @@ class Filter:
         )
 
     def _user_status_unit(self, __user__: dict) -> Optional["StatusUnit"]:
-        """The user's status-unit preference when set, else the filter valve.
-        A user valve that fails to parse falls back to the valve value."""
+        """The user's status-unit preference when set, else None (the caller
+        then uses the filter valve). Valves are plain strings since they are
+        dropdown-rendered; a value that fails to parse falls back."""
         user_valves = __user__.get("valves")
         if user_valves is None:
             return None

@@ -28,6 +28,15 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 Filter = _mod.Filter
 
+
+def mod_Filter_Valves_schema():
+    """The JSON schema Open WebUI's valve editor consumes (Valves.schema())."""
+    return _mod.Filter.Valves.schema()
+
+
+def mod_Filter_UserValves_schema():
+    return _mod.Filter.UserValves.schema()
+
 PASS = 0
 FAIL = 0
 
@@ -1007,8 +1016,9 @@ check(
     msg,
 )
 
-# milli-credits
-msg = f._usage_status_message("u1", "glm-5.3", unit=_mod.StatusUnit.MILLI_CREDITS)
+# milli-credits — set via the string valve, as the Open WebUI dropdown does
+f.valves.status_unit = "milli-credits"
+msg = f._usage_status_message("u1", "glm-5.3")
 check(
     "milli-credit unit shows thousandths",
     msg == "Credits: 141 mC/2M mC session (0.0%) - 141 mC/10M mC week (0.0%)",
@@ -1016,12 +1026,23 @@ check(
 )
 
 # raw
-msg = f._usage_status_message("u1", "glm-5.3", unit=_mod.StatusUnit.RAW)
+f.valves.status_unit = "raw"
+msg = f._usage_status_message("u1", "glm-5.3")
 check(
     "raw unit shows unrounded value",
     msg == "Credits: 0.141/2000 session (0.0%) - 0.141/10000 week (0.0%)",
     msg,
 )
+
+# garbage valve value falls back to whole credits
+f.valves.status_unit = "not-a-unit"
+msg = f._usage_status_message("u1", "glm-5.3")
+check(
+    "garbage unit falls back to credits",
+    msg == "Credits: 0.14/2000 session (0.0%) - 0.14/10K week (0.0%)",
+    msg,
+)
+f.valves.status_unit = "credits"
 
 # whole-credit formatting at scale: +500000 in, +100000 out -> +585 credits
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=500000, completion_tokens=100000))
@@ -1035,7 +1056,7 @@ check(
 # user valve override: milli-credits for this user only
 class UserValvesStub2:
     show_usage_status = True
-    status_unit = _mod.StatusUnit.MILLI_CREDITS
+    status_unit = "milli-credits"
 
 emitter = TestEventEmitter()
 run_inlet(
@@ -1067,6 +1088,25 @@ if statuses:
         "mC" not in statuses[0]["data"]["description"],
         statuses[0]["data"]["description"],
     )
+
+# valve spec shape: Open WebUI's editor renders a dropdown only from an
+# inline input.select config — a pydantic Enum serializes as a $ref with
+# no title and shows up as an untitled text box (regression guard)
+spec = mod_Filter_Valves_schema()
+su = spec["properties"]["status_unit"]
+check(
+    "status_unit spec carries inline select options",
+    su.get("input", {}).get("type") == "select"
+    and su["input"]["options"] == ["credits", "milli-credits", "raw"],
+    su,
+)
+check("status_unit spec has a title", su.get("title") == "Status Unit", su)
+uv = mod_Filter_UserValves_schema()["properties"]["status_unit"]
+check(
+    "UserValves status_unit spec carries select options too",
+    uv.get("input", {}).get("type") == "select" and uv.get("title"),
+    uv,
+)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

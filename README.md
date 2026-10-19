@@ -157,7 +157,10 @@ line for themselves via the filter's user valves — hiding it does not affect
 enforcement. API clients ignore status events entirely.
 
 The `status_unit` valve (filter-wide, with a per-user override in the user
-valves) picks the unit and precision of the amounts:
+valves) picks the unit and precision of the amounts. It is a dropdown in the
+valve editor (a string valve with `json_schema_extra` select options — note
+that a pydantic `Enum` field does *not* render as a dropdown in Open WebUI's
+editor; it shows as an untitled text box):
 
 | Unit | Example | Use |
 |---|---|---|
