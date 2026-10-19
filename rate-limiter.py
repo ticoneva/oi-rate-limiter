@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.9.2
+version: 1.0.0
 license: MIT
 """
 
@@ -21,18 +21,23 @@ class Filter:
         priority: int = Field(
             default=0, description="Priority level for the filter operations."
         )
-        requests_per_minute: Optional[int] = Field(
-            default=10, description="Maximum number of requests allowed per minute."
+        max_concurrent_requests: Optional[int] = Field(
+            default=10,
+            description=(
+                "Maximum simultaneous in-flight requests per user. None disables "
+                "the concurrency limit. A request holds a slot from admission "
+                "until its usage records (stream/outlet hook) or it falls silent "
+                "for in_flight_ttl_minutes."
+            ),
         )
-        requests_per_hour: Optional[int] = Field(
-            default=50, description="Maximum number of requests allowed per hour."
-        )
-        sliding_window_limit: Optional[int] = Field(
-            default=100,
-            description="Maximum number of requests allowed within the sliding window.",
-        )
-        sliding_window_minutes: Optional[int] = Field(
-            default=180, description="Duration of the sliding window in minutes."
+        in_flight_ttl_minutes: int = Field(
+            default=5,
+            description=(
+                "Silence window after which an in-flight slot is assumed dead "
+                "and released. Live streaming responses refresh their slot on "
+                "every chunk, so this bounds recovery from cancelled or errored "
+                "requests — it is not a maximum request duration."
+            ),
         )
         credits_per_minute: Optional[int] = Field(
             default=None,
@@ -192,6 +197,9 @@ class Filter:
         # Per-instance live-status state: (user_id, chat_id, message_id) ->
         # [generated_chars, last_emit_ts]. Cleared when usage records.
         self._live: dict = {}
+        # Per-instance in-flight refresh throttle: (user_id, member) ->
+        # last refresh ts, so the stream hook's Redis write is once a minute.
+        self._inflight_refresh: dict = {}
 
     def _get_redis(self) -> "redis.Redis":
         if self._redis is None:
@@ -201,8 +209,8 @@ class Filter:
         return self._redis
 
     @staticmethod
-    def _make_key(namespace: str, user_id: str) -> str:
-        return f"oi-rate-limiter:{namespace}:{user_id}"
+    def _inflight_key(namespace: str, user_id: str) -> str:
+        return f"oi-rate-limiter:{namespace}:{user_id}:inflight"
 
     @staticmethod
     def _credit_key(namespace: str, user_id: str) -> str:
@@ -225,9 +233,6 @@ class Filter:
     def _prune_key(self, key: str, now: float, window_secs: float):
         self._get_redis().zremrangebyscore(key, "-inf", now - window_secs)
 
-    def _count_key(self, key: str, start: float, end: float) -> int:
-        return self._get_redis().zcount(key, start, end)
-
     def _earliest_key(
         self, key: str, min_score: float, max_score: float
     ) -> Optional[float]:
@@ -238,39 +243,102 @@ class Filter:
             return results[0][1]
         return None
 
-    def rate_limited(
+    @staticmethod
+    def _inflight_member(metadata: Optional[dict]) -> Optional[str]:
+        """The zset member identifying one in-flight request. When the
+        caller's metadata carries chat and message ids the member is
+        reconstructible in the stream/outlet hooks, enabling exact release
+        and liveness refresh. Bare API calls have neither, so they fall
+        back to a unique member released FIFO."""
+        metadata = metadata or {}
+        chat_id, message_id = metadata.get("chat_id"), metadata.get("message_id")
+        if chat_id and message_id:
+            return f"{chat_id}:{message_id}"
+        return None
+
+    def _concurrency_limited(
         self, user_id: str, model_id: str
     ) -> Tuple[bool, Optional[int], int]:
+        """Returns (limited, wait_seconds, in_flight_count). Stale entries
+        (silent longer than the TTL) are pruned first, so the count only
+        includes requests believed live."""
         namespace = self._get_namespace(model_id)
-        key = self._make_key(namespace, user_id)
+        key = self._inflight_key(namespace, user_id)
         now = time.time()
+        ttl_secs = self.valves.in_flight_ttl_minutes * 60
 
-        # Prune expired entries outside the sliding window
-        self._prune_key(key, now, self.valves.sliding_window_minutes * 60)
+        self._prune_key(key, now, ttl_secs)
 
-        # Check per-minute limit
-        if self.valves.requests_per_minute is not None:
-            count = self._count_key(key, now - 60, "+inf")
-            if count >= self.valves.requests_per_minute:
-                earliest = self._earliest_key(key, now - 60, "+inf")
-                return True, int(60 - (now - earliest)), count
+        count = self._get_redis().zcard(key)
+        limit = self.valves.max_concurrent_requests
+        if limit is not None and count >= limit:
+            earliest = self._earliest_key(key, "-inf", "+inf")
+            wait = int(ttl_secs - (now - earliest)) if earliest else ttl_secs
+            return True, max(wait, 1), count
+        return False, None, count
 
-        # Check per-hour limit
-        if self.valves.requests_per_hour is not None:
-            count = self._count_key(key, now - 3600, "+inf")
-            if count >= self.valves.requests_per_hour:
-                earliest = self._earliest_key(key, now - 3600, "+inf")
-                return True, int(3600 - (now - earliest)), count
+    def _admit_inflight(self, user_id: str, model_id: str, metadata: Optional[dict]):
+        """Take an in-flight slot for this request. The member is the turn's
+        (chat_id, message_id) when known, else a unique fallback."""
+        namespace = self._get_namespace(model_id)
+        key = self._inflight_key(namespace, user_id)
+        member = self._inflight_member(metadata) or (
+            f"{time.time()}:{uuid.uuid4().hex}"
+        )
+        score = time.time()
 
-        # Check sliding window limit
-        if self.valves.sliding_window_limit is not None:
-            slide_secs = self.valves.sliding_window_minutes * 60
-            count = self._count_key(key, now - slide_secs, "+inf")
-            if count >= self.valves.sliding_window_limit:
-                earliest = self._earliest_key(key, now - slide_secs, "+inf")
-                return True, int(slide_secs - (now - earliest)), count
+        r = self._get_redis()
+        with r.pipeline() as pipe:
+            pipe.zadd(key, {member: score})
+            pipe.expire(key, self.valves.in_flight_ttl_minutes * 60)
+            pipe.execute()
 
-        return False, None, 0
+    def _refresh_inflight(
+        self, user_id: str, model_id: str, metadata: Optional[dict]
+    ):
+        """Bump a live request's slot so a long stream is not pruned by the
+        silence TTL. Throttled to once a minute per turn; the XX flag means
+        a refresh never creates a member that admission did not (e.g. an
+        admin-bypassed request, or one whose slot already expired and was
+        pruned — freeing it then was correct)."""
+        member = self._inflight_member(metadata)
+        if member is None:
+            return
+        key2 = (user_id, member)
+        now = time.time()
+        last = self._inflight_refresh.get(key2)
+        if last is not None and now - last < 60:
+            return
+        self._inflight_refresh[key2] = now
+
+        namespace = self._get_namespace(model_id)
+        key = self._inflight_key(namespace, user_id)
+        r = self._get_redis()
+        with r.pipeline() as pipe:
+            pipe.zadd(key, {member: now}, xx=True)
+            pipe.expire(key, self.valves.in_flight_ttl_minutes * 60)
+            pipe.execute()
+
+    def _release_inflight(
+        self,
+        user_id: str,
+        model_id: str,
+        metadata: Optional[dict],
+    ):
+        """Free this request's in-flight slot: exact removal when the turn
+        is identifiable, else the oldest member (FIFO — safe because the
+        count, not the identity, is what the limit enforces)."""
+        namespace = self._get_namespace(model_id)
+        key = self._inflight_key(namespace, user_id)
+        member = self._inflight_member(metadata)
+        r = self._get_redis()
+        if member is not None:
+            r.zrem(key, member)
+        else:
+            oldest = r.zrange(key, 0, 0)
+            if oldest:
+                r.zrem(key, oldest[0])
+        self._inflight_refresh.pop((user_id, member), None)
 
     def _credit_limits_configured(self) -> bool:
         return any(
@@ -497,19 +565,6 @@ class Filter:
         if not capped and "max_tokens" not in body and "max_completion_tokens" not in body:
             body["max_tokens"] = allowed
 
-    def log_request(self, user_id: str, model_id: str):
-        namespace = self._get_namespace(model_id)
-        key = self._make_key(namespace, user_id)
-        r = self._get_redis()
-
-        score = time.time()
-        member = f"{score}:{uuid.uuid4().hex}"
-
-        with r.pipeline() as pipe:
-            pipe.zadd(key, {member: score})
-            pipe.expire(key, self.valves.sliding_window_minutes * 60)
-            pipe.execute()
-
     @staticmethod
     def _retry_time(wait_seconds: int) -> str:
         future_time = datetime.now() + timedelta(seconds=wait_seconds)
@@ -692,13 +747,18 @@ class Filter:
         if self._enforced_for(__user__):
             user_id = __user__["id"]
             model_id = __model__["id"] if __model__ is not None else "default_model"
+            metadata = __metadata__ or {}
 
-            rate_limited, wait_time, request_count = self.rate_limited(
+            concurrency_limited, wait_time, in_flight = self._concurrency_limited(
                 user_id, model_id
             )
-            if rate_limited:
+            if concurrency_limited:
                 raise Exception(
-                    f"Rate limit exceeded. You have made {request_count} requests to model '{model_id}'. Please try again at {self._retry_time(wait_time)}."
+                    f"Concurrency limit reached. You have {in_flight} requests in flight "
+                    f"(limit {self.valves.max_concurrent_requests}) on model '{model_id}'. "
+                    f"Slots free automatically after ~{self.valves.in_flight_ttl_minutes} minutes "
+                    "of inactivity — if nothing is running, retry shortly. "
+                    f"Or try again at {self._retry_time(wait_time)}."
                 )
 
             if self._credit_limits_configured():
@@ -710,7 +770,7 @@ class Filter:
                         f"Credit limit exceeded. You have used {used_credits} of {credit_limit} credits on model '{model_id}'. Please try again at {self._retry_time(credit_wait)}."
                     )
 
-            self.log_request(user_id, model_id)
+            self._admit_inflight(user_id, model_id, metadata)
 
             if self.valves.show_usage_status:
                 await self._emit_usage_status(
@@ -735,7 +795,6 @@ class Filter:
             # Streaming requests place a transient hold instead: their exact
             # usage is recorded when the response completes, which also
             # releases the hold.
-            metadata = __metadata__ or {}
             is_web_ui = bool(metadata.get("session_id") or metadata.get("chat_id"))
             if streaming:
                 if self.valves.hold_credits_at_inlet:
@@ -768,7 +827,23 @@ class Filter:
         (no websocket session) delivers raw SSE lines. The event is always
         returned unmodified — bytes and framing must reach the client intact.
         """
-        if not self._credit_limits_configured() or not self._enforced_for(__user__):
+        if not self._enforced_for(__user__):
+            return event
+
+        # Liveness: every chunk proves the request is still streaming, so
+        # bump its in-flight slot (throttled) ahead of the silence TTL.
+        # Runs before the credit-config gate — concurrency tracking must
+        # stay live even with all credit limits disabled.
+        try:
+            self._refresh_inflight(
+                __user__["id"],
+                __model__["id"] if __model__ is not None else "default_model",
+                __metadata__,
+            )
+        except Exception as e:
+            print(f"rate-limiter: in-flight refresh failed: {e}")
+
+        if not self._credit_limits_configured():
             return event
 
         # Live status: estimate in-flight decode cost from content deltas.
@@ -829,6 +904,10 @@ class Filter:
             self._clear_live_status(__user__, __metadata__)
             self._record_usage(user_id, model_id, input_tokens, cached_tokens, output_tokens)
 
+            # The turn finished: free its in-flight slot now rather than
+            # waiting out the silence TTL.
+            self._release_inflight(user_id, model_id, __metadata__)
+
             # Mark this chat turn as accounted, so the outlet hook (which
             # fires after streaming turns too) does not double-charge it.
             metadata = __metadata__ or {}
@@ -852,8 +931,10 @@ class Filter:
         __model__: Optional[dict] = None,
     ) -> dict:
         """Record exact usage for non-streaming web UI turns, as a fallback
-        for turns the stream hook did not already account for."""
-        if not self._credit_limits_configured() or not self._enforced_for(__user__):
+        for turns the stream hook did not already account for. Also frees
+        the turn's in-flight slot — the primary release path when credits
+        are disabled or the stream never reported usage."""
+        if not self._enforced_for(__user__):
             return body
 
         user_id = __user__["id"]
@@ -875,10 +956,21 @@ class Filter:
         if already_recorded:
             # The stream hook already accounted this turn; still refresh the
             # status line so the user sees post-turn numbers.
-            if self.valves.show_usage_status:
+            if self.valves.show_usage_status and self._credit_limits_configured():
                 await self._emit_usage_status(
                     __event_emitter__, __user__, user_id, model_id
                 )
+            return body
+
+        # Turn finished without the stream hook accounting it — release the
+        # in-flight slot now (marker-gated by `already_recorded` above, so a
+        # stream-accounted turn released there cannot double-release).
+        try:
+            self._release_inflight(user_id, model_id, {"chat_id": chat_id, "message_id": message_id})
+        except Exception as e:
+            print(f"rate-limiter: in-flight release failed: {e}")
+
+        if not self._credit_limits_configured():
             return body
 
         usage = body.get("usage")

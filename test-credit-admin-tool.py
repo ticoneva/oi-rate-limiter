@@ -104,12 +104,12 @@ check("6h-old record outside 5h session", "session (5h): 0 credits over 0 reques
 check("6h-old record inside week", "week: 7 credits over 1 requests" in out, out)
 check("all-time keeps it", "all time: 7 credits over 1 requests" in out, out)
 
-print("== 4. Holds and request keys ==")
+print("== 4. Holds and in-flight keys ==")
 t = make_tool()
 r = t._get_redis()
 add_record(t, "glm-5.3", "u1", 10, 0, 5, 3)
 r.zadd(f"oi-rate-limiter:glm-5.3:u1:holds", {f"{time.time()}:{uuid.uuid4().hex}:50": time.time()})
-r.zadd(f"oi-rate-limiter:glm-5.3:u1", {f"{time.time()}:{uuid.uuid4().hex}": time.time()})
+r.zadd(f"oi-rate-limiter:glm-5.3:u1:inflight", {f"c1:m1": time.time()})
 r.set(f"oi-rate-limiter:glm-5.3:u1:done:c:m", "1", ex=900)
 
 print("== 5. Clear requires confirm ==")
@@ -123,7 +123,7 @@ out = run(t.clear_credit_usage(user="u1", namespace="glm-5.3", confirm=True, __u
 check("clear reports success", "Cleared usage" in out, out)
 check("glm credits gone", not t._get_redis().exists("oi-rate-limiter:glm-5.3:u1:credits"))
 check("glm holds gone", not t._get_redis().exists("oi-rate-limiter:glm-5.3:u1:holds"))
-check("glm request log gone", not t._get_redis().exists("oi-rate-limiter:glm-5.3:u1"))
+check("glm in-flight gone", not t._get_redis().exists("oi-rate-limiter:glm-5.3:u1:inflight"))
 check("done markers survive (scoped)", t._get_redis().exists("oi-rate-limiter:glm-5.3:u1:done:c:m"))
 check("qwen credits survive", t._get_redis().exists("oi-rate-limiter:qwen-3.5:u1:credits"))
 
@@ -131,7 +131,14 @@ print("== 7. Clear all namespaces ==")
 out = run(t.clear_credit_usage(user="u1", confirm=True, __user__=admin()))
 check("all clear succeeds", "Cleared usage" in out, out)
 check("qwen credits gone", not t._get_redis().exists("oi-rate-limiter:qwen-3.5:u1:credits"))
-check("request keys swept when un-namespaced", not [k for k in t._get_redis().keys("oi-rate-limiter:*") if k.split(":")[-1] == "u1"])
+check(
+    "credits/holds/inflight swept when un-namespaced",
+    not [
+        k
+        for k in t._get_redis().keys("oi-rate-limiter:*:u1:*")
+        if not ":done:" in k
+    ],
+)
 
 print("== 8. Redis errors surface as strings ==")
 t = make_tool()

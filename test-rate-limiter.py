@@ -1,9 +1,11 @@
 """Tests for rate-limiter.py simulating the Open WebUI filter runtime.
 
-Covers: request limits, credit budgets, weight math, cache-hit discount,
+Covers: the concurrency limit (admission, release on stream/outlet, marker
+dedup, liveness refresh, silence expiry, FIFO fallback for bare API calls,
+shared namespaces), credit budgets, weight math, cache-hit discount,
 stream-hook formats (dict / raw SSE bytes), outlet dedup via done markers,
-non-streaming input estimation, max_tokens capping, shared namespaces with
-per-instance weights, and multi-worker consistency via fakeredis shared state.
+non-streaming input estimation, max_tokens capping, and multi-worker
+consistency via fakeredis shared state.
 
 Run: python3 test-rate-limiter.py
 """
@@ -13,6 +15,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 
 import fakeredis
 import pydantic
@@ -60,6 +63,7 @@ def make_filter(**valves):
         credits_per_minute=None,
         credits_per_session=None,
         sliding_window_credits=None,
+        max_concurrent_requests=None,
     )
     base.update(valves)
     f.valves = f.Valves(**base)
@@ -117,27 +121,32 @@ def vllm_final_chunk_dict(prompt_tokens, completion_tokens, cached_tokens=None):
     return json.loads(vllm_final_chunk(prompt_tokens, completion_tokens, cached_tokens))
 
 
-print("== 1. Request-count limits (unchanged behavior) ==")
-f = make_filter(requests_per_minute=2)
+print("== 1. Concurrency limit ==")
+f = make_filter(max_concurrent_requests=2)
+meta = {"chat_id": "c0", "message_id": "m1"}
 for i in range(2):
-    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]})
+    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]}, metadata={"chat_id": "c0", "message_id": f"m{i}"})
 blocked = None
 try:
-    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]})
+    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]}, metadata={"chat_id": "c0", "message_id": "m2"})
     blocked = False
 except Exception as e:
-    blocked = True
-check("3rd request blocked per-minute", blocked)
+    blocked = "Concurrency limit reached" in str(e)
+check("3rd concurrent request blocked", blocked)
 check(
     "no credits recorded when limits disabled",
     not [k for k in f._get_redis().keys() if k.endswith(":credits")],
 )
+# key format: reconstructible member {chat}:{message}
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+check(
+    "in-flight members are chat:message ids",
+    sorted(f._get_redis().zrange(key, 0, -1)) == ["c0:m0", "c0:m1"],
+    f._get_redis().zrange(key, 0, -1),
+)
 
 print("== 2. Credit limit blocking via stream usage ==")
 f = make_filter(
-    requests_per_minute=None,
-    requests_per_hour=None,
-    sliding_window_limit=None,
     sliding_window_credits=1000,
 )
 run_inlet(f, {"stream": True, "messages": []})
@@ -155,7 +164,6 @@ check("blocked after exceeding credit budget", blocked)
 
 print("== 3. Weights: prefill/decode differential pricing ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000, input_weight=1.0, output_weight=4.0,
 )
 run_inlet(f, {"stream": True, "messages": []})
@@ -167,7 +175,6 @@ check("weighted charge = 3000", members[0].rsplit(":", 1)[1] == "3000", members[
 
 print("== 4. Cache-hit discount ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000, input_weight=1.0, cached_input_weight=0.2,
     output_weight=1.0,
 )
@@ -192,7 +199,6 @@ check(
 
 print("== 5. No cached_tokens reported -> full prefill charged ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000, cached_input_weight=0.0,
 )
 run_inlet(f, {"stream": True, "messages": []})
@@ -207,7 +213,6 @@ check(
 
 print("== 6. Raw SSE line (API path) ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000,
 )
 line = f"data: {vllm_final_chunk(prompt_tokens=300, completion_tokens=50)}\n\n".encode()
@@ -227,7 +232,6 @@ check("[DONE] passes through", out == b"data: [DONE]\n\n")
 
 print("== 7. Normalized / Ollama usage formats ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000,
 )
 run_stream(f, {"usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}})
@@ -250,7 +254,6 @@ check("two records recorded", len(members) == 2, members)
 
 print("== 8. Outlet: web UI non-streaming turn ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000,
 )
 out = run_outlet(
@@ -275,7 +278,6 @@ check("outlet records assistant usage", f._get_redis().zcard(key) == 1)
 
 print("== 9. Outlet dedup against stream (done marker) ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000,
 )
 meta = {"chat_id": "c1", "message_id": "m1"}
@@ -301,7 +303,6 @@ check("stream + outlet = single record", f._get_redis().zcard(key) == 1)
 
 print("== 10. Non-streaming API estimate ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=100000, chars_per_token=3.0,
 )
 body = {"messages": [{"role": "user", "content": "a" * 300}]}
@@ -315,7 +316,6 @@ check(
 )
 # web UI call (session_id present) is not estimated
 f2 = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=100000, chars_per_token=3.0,
 )
 run_inlet(f2, {"messages": [{"role": "user", "content": "a" * 300}]},
@@ -327,7 +327,6 @@ check(
 
 print("== 11. max_tokens capping ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=1000, output_weight=4.0, cap_max_tokens_to_budget=True,
 )
 run_inlet(f, {"stream": True, "messages": [], "max_tokens": 400})
@@ -338,7 +337,6 @@ run_inlet(f, body)
 check("max_tokens clamped to remaining/output_weight", body["max_tokens"] == 125, body)
 
 f3 = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=1000, output_weight=4.0, cap_max_tokens_to_budget=True,
 )
 body = {"stream": True, "messages": []}  # no max_tokens at all
@@ -350,14 +348,12 @@ shared_server = fakeredis.FakeServer()
 fa = Filter()
 fa._redis = fakeredis.FakeStrictRedis(server=shared_server, decode_responses=True)
 fa.valves = fa.Valves(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=1000, rate_limiter_id="pool", input_weight=1.0,
     output_weight=1.0,
 )
 fb = Filter()
 fb._redis = fakeredis.FakeStrictRedis(server=shared_server, decode_responses=True)
 fb.valves = fb.Valves(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=1000, rate_limiter_id="pool", input_weight=1.0,
     output_weight=3.0,
 )
@@ -390,7 +386,6 @@ check(
 
 print("== 14. Admin bypass and enabled_for_admins ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10, enabled_for_admins=False,
 )
 run_stream(
@@ -407,7 +402,6 @@ check(
 )
 
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=1000,
 )
 run_stream(
@@ -419,9 +413,21 @@ check(
     [k for k in f._get_redis().keys() if k.endswith(":credits")],
 )
 
+# Admin bypass on concurrency: no admission, no release, no tracking.
+f = make_filter(max_concurrent_requests=1, enabled_for_admins=False)
+for i in range(3):
+    run_inlet(
+        f, {"messages": []},
+        u=user("admin3", role="admin"),
+        metadata={"chat_id": "ca", "message_id": f"m{i}"},
+    )
+check(
+    "admin bypass: no in-flight slots taken",
+    not [k for k in f._get_redis().keys() if k.endswith(":inflight")],
+)
+
 print("== 15. stream_options injection ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
 )
 body = {"stream": True, "messages": []}
 run_inlet(f, body)
@@ -439,7 +445,6 @@ check("no injection when not streaming", "stream_options" not in body)
 
 print("== 16. All credit limits disabled -> no recording overhead ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
 )
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=100))
 check(
@@ -447,37 +452,181 @@ check(
     not [k for k in f._get_redis().keys() if k.endswith(":credits")],
 )
 
-print("== 17. Request keys unchanged from previous version ==")
+print("== 17. In-flight key format (bare API call) ==")
 f = make_filter()
-run_inlet(f, {"messages": []})
-keys = f._get_redis().keys()
+run_inlet(f, {"messages": []})  # no chat/message ids -> uuid fallback member
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+members = f._get_redis().zrange(key, 0, -1)
 check(
-    "request key format backward compatible",
-    any(k == "oi-rate-limiter:glm-5.3:u1" for k in keys),
-    keys,
+    "uuid fallback member with timestamp",
+    len(members) == 1 and members[0].split(":")[1].strip() != ""
+    and len(members[0].split(":")) == 2,
+    members,
 )
+check("in-flight key has TTL", 0 < f._get_redis().ttl(key) <= 5 * 60, f._get_redis().ttl(key))
 
-print("== 18. Credits do not affect request limits and vice versa ==")
+print("== 18. Concurrency enforced independently of credits ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=1,
+    max_concurrent_requests=1,
     sliding_window_credits=100000,
 )
+# first request in flight (not completed): the slot must block the second
 run_inlet(f, {"messages": []})
-run_stream(f, vllm_final_chunk_dict(prompt_tokens=99999, completion_tokens=99999))
 blocked = None
 try:
     run_inlet(f, {"messages": []})
     blocked = False
 except Exception as e:
-    blocked = "Rate limit" in str(e)
-check("request limit still enforced independently", blocked)
+    blocked = "Concurrency limit reached" in str(e)
+check("concurrency limit enforced with credits on", blocked)
+
+print("== 18b. Slot released when usage records via stream ==")
+f = make_filter(max_concurrent_requests=1, sliding_window_credits=100000)
+meta = {"chat_id": "c1", "message_id": "m1"}
+run_inlet(f, {"stream": True, "messages": []}, metadata=meta)
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+check("slot held during flight", f._get_redis().zcard(key) == 1)
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=50), metadata=meta)
+check("slot freed after usage records", f._get_redis().zcard(key) == 0)
+# user can immediately run another request
+run_inlet(f, {"stream": True, "messages": []}, metadata={"chat_id": "c1", "message_id": "m2"})
+check("new request admitted after release", f._get_redis().zcard(key) == 1)
+
+print("== 18c. Slot released via outlet (non-streaming turn) ==")
+f = make_filter(max_concurrent_requests=1, sliding_window_credits=100000)
+run_inlet(f, {"messages": []}, metadata={"chat_id": "c2", "message_id": "m1"})
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+check("slot held before outlet", f._get_redis().zcard(key) == 1)
+run_outlet(
+    f,
+    {
+        "model": "glm-5.3",
+        "chat_id": "c2",
+        "id": "m1",
+        "messages": [
+            {
+                "id": "m1",
+                "role": "assistant",
+                "content": "x",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            }
+        ],
+    },
+)
+check("outlet frees the slot", f._get_redis().zcard(key) == 0)
+
+print("== 18d. Marker dedup: stream then outlet releases once ==")
+f = make_filter(max_concurrent_requests=1, sliding_window_credits=100000)
+meta = {"chat_id": "c3", "message_id": "m1"}
+run_inlet(f, {"stream": True, "messages": []}, metadata=meta)
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=20), metadata=meta)
+# m1's slot was released by the stream hook; a second request is now in flight
+run_inlet(f, {"stream": True, "messages": []}, metadata={"chat_id": "c3", "message_id": "m2"})
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+check("m2 slot held after m1 completed", f._get_redis().zcard(key) == 1)
+# outlet for the already-recorded m1 must NOT release again (marker set):
+# without the marker it would FIFO-release m2's slot
+run_outlet(
+    f,
+    {
+        "model": "glm-5.3",
+        "chat_id": "c3",
+        "id": "m1",
+        "messages": [
+            {"id": "m1", "role": "assistant", "content": "x",
+             "usage": {"input_tokens": 100, "output_tokens": 20}}
+        ],
+    },
+)
+check("outlet after stream-accounted turn does not release m2", f._get_redis().zcard(key) == 1)
+
+print("== 18e. Liveness refresh keeps a long stream's slot alive ==")
+f = make_filter(max_concurrent_requests=1, in_flight_ttl_minutes=5)
+meta = {"chat_id": "c4", "message_id": "m1"}
+run_inlet(f, {"stream": True, "messages": []}, metadata=meta)
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+# age the member past the TTL, then send a chunk to refresh it
+old = time.time() - 6 * 60
+f._get_redis().zadd(key, {"c4:m1": old}, xx=True)
+f._inflight_refresh.clear()  # defeat the 60s throttle for the test
+run_stream(f, {"id": "x", "choices": [{"delta": {"content": "hello"}}]}, metadata=meta)
+score_after = f._get_redis().zscore(key, "c4:m1")
+check("chunk bumps the slot score past the silence window", score_after is not None and score_after > old + 5 * 60, score_after)
+# XX guard: refreshing an absent member must not create one
+f._get_redis().delete(key)
+f._inflight_refresh.clear()
+run_stream(f, {"id": "x", "choices": [{"delta": {"content": "hi"}}]}, metadata=meta)
+check("XX guard: refresh does not create a missing slot", not f._get_redis().exists(key))
+
+print("== 18f. Silence expiry: stale slot stops counting ==")
+f = make_filter(max_concurrent_requests=1, in_flight_ttl_minutes=5)
+run_inlet(f, {"messages": []}, metadata={"chat_id": "c5", "message_id": "m1"})
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+# the request died silently: backdate its score beyond the TTL
+old = time.time() - 6 * 60
+f._get_redis().zadd(key, {"c5:m1": old}, xx=True)
+blocked = None
+try:
+    run_inlet(f, {"messages": []}, metadata={"chat_id": "c5", "message_id": "m2"})
+    blocked = False
+except Exception as e:
+    blocked = "Concurrency limit reached" in str(e)
+check("stale slot pruned, new request admitted", not blocked)
+
+print("== 18g. Bare API call: FIFO fallback release ==")
+f = make_filter(max_concurrent_requests=2, sliding_window_credits=100000)
+# two API calls with no chat/message identity -> uuid members
+run_inlet(f, {"stream": True, "messages": []})
+run_inlet(f, {"stream": True, "messages": []})
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+check("two uuid slots", f._get_redis().zcard(key) == 2)
+# usage records without reconstructible identity -> FIFO release of the oldest
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=10))
+check("FIFO release frees one uuid slot", f._get_redis().zcard(key) == 1)
+
+print("== 18h. Users and namespaces independent ==")
+f = make_filter(max_concurrent_requests=1)
+run_inlet(f, {"messages": []}, metadata={"chat_id": "c6", "message_id": "m1"})  # u1 in glm-5.3
+# same user, other model namespace -> separate slot pool
+run_inlet(f, {"messages": []}, model={"id": "qwen-3.5", "info": {}}, metadata={"chat_id": "c6", "message_id": "m2"})
+check(
+    "namespaces have separate in-flight sets",
+    f._get_redis().zcard("oi-rate-limiter:glm-5.3:u1:inflight") == 1
+    and f._get_redis().zcard("oi-rate-limiter:qwen-3.5:u1:inflight") == 1,
+)
+# other user, same namespace -> not blocked by u1's slot
+run_inlet(f, {"messages": []}, u=user("u2"), metadata={"chat_id": "c7", "message_id": "m3"})
+check("other user unaffected", f._get_redis().zcard("oi-rate-limiter:glm-5.3:u2:inflight") == 1)
+# u1 is now blocked in glm-5.3
+blocked = None
+try:
+    run_inlet(f, {"messages": []}, metadata={"chat_id": "c6", "message_id": "m9"})
+    blocked = False
+except Exception:
+    blocked = True
+check("original user still capped", blocked)
+
+print("== 18i. Shared rate_limiter_id shares slots ==")
+f = make_filter(max_concurrent_requests=1, rate_limiter_id="shared-pool")
+run_inlet(f, {"messages": []}, model={"id": "glm-5.3", "info": {}}, metadata={"chat_id": "c8", "message_id": "m1"})
+blocked = None
+try:
+    # different model id, same rate_limiter_id -> same namespace -> same pool
+    run_inlet(f, {"messages": []}, model={"id": "qwen-3.5", "info": {}}, metadata={"chat_id": "c8", "message_id": "m2"})
+    blocked = False
+except Exception:
+    blocked = True
+check("shared namespace enforces one combined pool", blocked)
+check(
+    "shared namespace in-flight key",
+    f._get_redis().zcard("oi-rate-limiter:shared-pool:u1:inflight") == 1,
+)
 
 print("== 19. Concurrent burst: holds block at the door ==")
 # User with empty history fires many simultaneous streaming requests whose
 # combined actual cost would exceed the budget. With holds, request k sees
 # the k-1 pending estimates and gets blocked before generating.
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=600, chars_per_token=1.0,  # 300-char prompt = 300 est
 )
 body = {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]}
@@ -510,7 +659,6 @@ check("net charge = exact usage (300 x 2)", charges == ["300", "300"], charges)
 
 print("== 21. Abandoned request: hold expires via TTL ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=600, chars_per_token=1.0, hold_ttl_minutes=15,
 )
 run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]})
@@ -526,7 +674,6 @@ check("expired hold stops counting", used == 0, used)
 
 print("== 22. Output reserve in hold ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=10000, chars_per_token=1.0,
     hold_output_reserve_tokens=100, output_weight=4.0,
 )
@@ -537,7 +684,6 @@ check("hold includes output reserve", members[0].rsplit(":", 1)[1] == "500", mem
 
 print("== 23. Session window (z.ai 5-hour style) ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=500, session_window_minutes=300,
     sliding_window_credits=None, chars_per_token=1.0,
 )
@@ -553,7 +699,6 @@ check("wait is bounded by the 5h window", wait is not None and wait <= 300 * 60,
 
 print("== 24. Holds disabled -> original post-hoc behavior ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=600, chars_per_token=1.0, hold_credits_at_inlet=False,
 )
 body = {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]}
@@ -572,7 +717,6 @@ check(
 
 print("== 25. max_tokens cap sees holds too ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     sliding_window_credits=1000, chars_per_token=1.0,
     cap_max_tokens_to_budget=True, hold_output_reserve_tokens=0,
 )
@@ -617,7 +761,6 @@ check(
 
 print("== 27. Usage status display ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000, sliding_window_credits=10000,
     show_usage_status=True, chars_per_token=1.0,
 )
@@ -647,7 +790,6 @@ check(
 
 print("== 28. Status off by default / per-user opt-out ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000,
 )
 emitter = TestEventEmitter()
@@ -659,7 +801,6 @@ check(
 )
 
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000, show_usage_status=True,
 )
 # user valve opt-out: __user__["valves"].show_usage_status = False
@@ -679,7 +820,6 @@ check(
 
 # outlet emits refreshed status after recording
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000, show_usage_status=True,
 )
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=50))  # 150
@@ -715,7 +855,6 @@ if statuses:
 
 # large numbers format as K
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000, show_usage_status=True, chars_per_token=1.0,
 )
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=1500, completion_tokens=0))
@@ -724,7 +863,6 @@ check("integer formatting below 10K", msg.startswith("Credits: 1500/2000 session
 
 print("== 29. Live status ticks during generation ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000, show_usage_status=True, chars_per_token=1.0,
     status_interval_seconds=0,  # emit on every chunk for testing
 )
@@ -768,7 +906,6 @@ check(
 
 print("== 30. Outlet refreshes status after streaming turn ==")
 f = make_filter(
-    requests_per_minute=None, requests_per_hour=None, sliding_window_limit=None,
     credits_per_session=2000, show_usage_status=True,
 )
 meta = {"chat_id": "c2", "message_id": "m2"}

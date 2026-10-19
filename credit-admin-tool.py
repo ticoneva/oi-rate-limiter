@@ -2,7 +2,7 @@
 title: Credit Usage Admin Tool
 author: Assistant
 author_url: https://github.com/ticoneva/oi-rate-limiter
-version: 0.3.0
+version: 0.4.0
 license: MIT
 
 Admin-only companion to the Rate and Credit Limit Filter. Queries a user's
@@ -347,8 +347,9 @@ class Tools:
         __user__: Optional[dict] = None,
     ) -> str:
         """
-        Clear a user's recorded credit usage (and any pending holds). The
-        user's budget resets immediately for the cleared namespaces.
+        Clear a user's recorded credit usage (and any pending holds and
+        in-flight slots). The user's budget and concurrency slots reset
+        immediately for the cleared namespaces.
         Admin-only.
 
         :param user: Open WebUI user ID, email, or name (must match uniquely).
@@ -385,29 +386,31 @@ class Tools:
         if not targets:
             return f"No credit records found for {display}"
         if not namespace:
-            # An un-namespaced clear also sweeps hold and request keys, so
-            # request-count limits do not keep blocking a cleared user.
+            # An un-namespaced clear also sweeps hold and in-flight keys, so
+            # credit holds and the concurrency limit do not keep blocking a
+            # cleared user (in-flight slots are the escape hatch for leaked
+            # slots from cancelled requests).
             hold_keys = list(r.scan_iter(match=f"oi-rate-limiter:*:{user_id}:holds"))
-            req_keys = [
-                k
-                for k in r.scan_iter(match=f"oi-rate-limiter:*:{user_id}")
-                if not k.endswith((":credits", ":holds", ":done"))
-            ]
+            inflight_keys = list(
+                r.scan_iter(match=f"oi-rate-limiter:*:{user_id}:inflight")
+            )
         else:
             hold_keys = [f"oi-rate-limiter:{namespace.strip()}:{user_id}:holds"]
-            req_keys = [f"oi-rate-limiter:{namespace.strip()}:{user_id}"]
+            inflight_keys = [
+                f"oi-rate-limiter:{namespace.strip()}:{user_id}:inflight"
+            ]
 
         deleted_credits = 0
         for _, key in targets:
             deleted_credits += r.delete(key)
         deleted_holds = sum(r.delete(k) for k in hold_keys)
-        deleted_requests = sum(r.delete(k) for k in req_keys)
+        deleted_inflight = sum(r.delete(k) for k in inflight_keys)
 
         cleared_ns = ", ".join(ns for ns, _ in targets)
         parts = [
             f"Cleared usage for {display}.",
             f"Namespaces: {cleared_ns}",
-            f"Deleted keys: {deleted_credits} credit, {deleted_holds} hold, {deleted_requests} request-log",
+            f"Deleted keys: {deleted_credits} credit, {deleted_holds} hold, {deleted_inflight} in-flight",
         ]
         return ". ".join(parts)
 

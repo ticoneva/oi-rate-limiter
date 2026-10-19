@@ -1,7 +1,7 @@
 # Open WebUI Rate Limiter
 
 A filter for [Open WebUI](https://github.com/open-webui/open-webui) that enforces
-per-user request rate limits and credit budgets (weighted token limits).
+a per-user concurrency limit and credit budgets (weighted token limits).
 
 ## How many credits does my usage cost?
 
@@ -43,11 +43,13 @@ cache hits, which in practice stretch it considerably.
 
 Open WebUI can run with **multiple workers**, each handling requests independently. A rate limiter that stores counts in memory (e.g. a Python `dict`) only knows about the requests it has personally seen. The same user hitting two different workers would never exceed the limit, even though they've made twice as many requests.
 
-This rate limiter uses **Redis sorted sets** as a shared, centralized counter so all workers agree on how many requests each user has made, and how many credits they have consumed, and limits are enforced consistently regardless of which worker processes a request.
+This rate limiter uses **Redis sorted sets** as a shared, centralized counter so all workers agree on how many requests each user has in flight, and how many credits they have consumed, and limits are enforced consistently regardless of which worker processes a request.
 
 ## Two kinds of limits
 
-**Request limits** count requests per user, exactly as previous versions did.
+**Concurrency** caps how many of a user's requests may be *in flight* at once
+(simultaneously admitted, not yet finished) — mirroring how coding-plan
+providers actually limit request traffic.
 
 **Credit budgets** count *credits* — weighted tokens. When a model response
 finishes, its token usage is charged as:
@@ -66,6 +68,39 @@ Because credits are charged with each filter instance's own weights **at write
 time**, models with different pricing can share one budget via the same
 `rate_limiter_id` — a budget of 1,000,000 credits means 1M *base-model
 equivalent* tokens, not 1M raw tokens across mixed models.
+
+### Concurrency limit (in-flight slots)
+
+`max_concurrent_requests` (default 10) caps how many of a user's requests may
+run simultaneously per namespace. A request takes a **slot** at admission and
+frees it when its usage is recorded (stream final chunk, or the outlet hook
+for non-streaming turns). The design's core constraint is that end-of-request
+signals are not guaranteed — Open WebUI skips the outlet hook when a client
+disconnects mid-stream or the upstream errors — so slots must recover on
+their own:
+
+- **Liveness refresh**: every streamed chunk bumps the request's slot, so a
+  live stream holds its slot for as long as it generates, however long that is.
+- **Silence TTL** (`in_flight_ttl_minutes`, default 5): a slot silent for
+  this long is treated as dead and pruned. A cancelled or errored request
+  stops producing chunks, so its slot frees within minutes — the TTL is a
+  *silence window*, not a maximum request duration.
+
+The failure direction is chosen deliberately: on the odd edge (a genuinely
+silent-but-alive request, e.g. a very long time-to-first-token), a slot may
+be pruned early and the user briefly exceeds the cap — the limit *softens*
+rather than locking anyone out. A leaked slot can never strand a user,
+because it self-expires in minutes.
+
+Slots are identified by the turn's `(chat_id, message_id)` when the web UI
+supplies them, giving exact release; bare API calls without that identity
+use unique members and are released FIFO. Two smaller caveats: admission
+check-then-add is not atomic, so a burst of near-simultaneous inlets can
+exceed the cap by one or two (the same accepted race the credit holds have);
+and API-path release relies on Open WebUI's `ENABLE_API_OUTLET_FILTERS`
+(default on) — without it, API slots are recovered solely by the silence TTL.
+The admin tool's `clear_credit_usage` also deletes in-flight slots, the
+manual escape hatch if a user ever reports being stuck.
 
 ### Where usage is counted
 
@@ -128,10 +163,8 @@ the same field).
 
 | Setting | Default | Description |
 |---|---|---|
-| `requests_per_minute` | 10 | Max requests per minute per user |
-| `requests_per_hour` | 50 | Max requests per hour per user |
-| `sliding_window_limit` | 100 | Max requests per sliding window |
-| `sliding_window_minutes` | 180 | Request sliding window duration in minutes |
+| `max_concurrent_requests` | 10 | Max simultaneous in-flight requests per user (None disables) |
+| `in_flight_ttl_minutes` | 5 | Silence window after which an unresponsive in-flight slot is released |
 | `credits_per_minute` | (disabled) | Credit budget per minute per user |
 | `credits_per_session` | 2000 | Credit budget per session window — z.ai GLM Coding Plan Lite 5-hour allowance |
 | `session_window_minutes` | 300 | Session credit window duration in minutes |
@@ -158,13 +191,14 @@ Deploying the filter with default valves enforces z.ai's GLM Coding Plan
 multipliers) — one credit unit equals one z.ai credit. For the Pro plan
 ($80/mo), set `credits_per_session: 12000` and `sliding_window_credits:
 60000`; for Lite's weights on GLM-5.3-Flash, set the multipliers to
-2.3/0.56/8 (÷10,000). Request-count limits remain on top of the credit
-budgets and may need loosening (the defaults, 10/minute and 100/3h, are
-stricter than z.ai's plan semantics).
+2.3/0.56/8 (÷10,000).
 
 ## Redis layout
 
-- `oi-rate-limiter:{namespace}:{user_id}` — request log (unchanged from 0.4.0)
+- `oi-rate-limiter:{namespace}:{user_id}:inflight` — in-flight request slots;
+  sorted-set members are `{chat_id}:{message_id}` (web UI turns, exact
+  release) or `{timestamp}:{uuid}` (bare API calls, FIFO release), scored by
+  last activity and TTL-bounded by the silence window
 - `oi-rate-limiter:{namespace}:{user_id}:credits` — credit records; sorted-set
   members are `{timestamp}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}`
   so raw splits survive for reporting and re-derivation
@@ -213,10 +247,11 @@ same instance.
   sanitized copy of `reason` and shows up in usage reports as a "manual
   adjustments" line. Scoped to one namespace or all of the user's namespaces.
 - **`clear_credit_usage(user, namespace="", confirm=false)`** — admin-only.
-  Deletes the user's credit records (and pending holds) for one namespace or
-  all, resetting their budget. Requires `confirm=true` to act, so a model
-  misunderstanding cannot wipe data; an un-namespaced clear also sweeps
-  request-count keys so rate limits unblock too.
+  Deletes the user's credit records (and pending holds and in-flight slots)
+  for one namespace or all, resetting their budget and freeing their
+  concurrency slots. Requires `confirm=true` to act, so a model
+  misunderstanding cannot wipe data. This is also the escape hatch if a user
+  ever reports being stuck at the concurrency limit.
 
 Permissions: **admins** may query, adjust, and clear anyone's usage (an empty
 `user` means themselves). **Everyone else** may only **query their own**
