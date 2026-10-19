@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: Vinci Chow
 author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
-version: 1.1.2
+version: 1.1.3
 license: MIT
 """
 
@@ -229,8 +229,13 @@ class Filter:
             description="Show the credit usage status line on your requests. "
             "Limit enforcement is unaffected.",
         )
-        status_unit: str = Field(
-            default="credits",
+        status_unit: Optional[str] = Field(
+            default=None,
+            # None (the editor's "Default" state) means "follow the filter
+            # valve". This must NOT default to "credits": Open WebUI always
+            # attaches a UserValves instance to __user__ — with field
+            # defaults when the user never saved anything — so a non-None
+            # default here would permanently shadow the filter-wide valve.
             # No description — see the Valves comment above: the editor
             # would show it as a duplicated first dropdown item.
             json_schema_extra={

@@ -1089,6 +1089,33 @@ if statuses:
         statuses[0]["data"]["description"],
     )
 
+# unset user valves must NOT shadow the filter valve. Open WebUI always
+# attaches a UserValves instance (field defaults when the user never saved
+# anything), so a non-None default here would win over the filter valve
+# forever — exactly the "dropdown changes nothing" bug. f currently has
+# status_unit="credits" on the valve; a default-constructed UserValves
+# must leave it in force, and switching the filter valve must show through.
+f.valves.status_unit = "milli-credits"
+
+class UserValvesStub4:  # simulated UserValves() with all defaults
+    show_usage_status = True
+    status_unit = None
+
+emitter = TestEventEmitter()
+run_inlet(
+    f, {"stream": True, "messages": []}, emitter=emitter,
+    u={"id": "u1", "role": "user", "valves": UserValvesStub4()},
+)
+statuses = [e for e in emitter.events if e.get("type") == "status"]
+if statuses:
+    check(
+        "unset user valve follows filter valve (no shadowing)",
+        "mC" in statuses[0]["data"]["description"],
+        statuses[0]["data"]["description"],
+    )
+
+f.valves.status_unit = "credits"
+
 # valve spec shape: Open WebUI's editor renders a dropdown only from an
 # inline input.select config — a pydantic Enum serializes as a $ref with
 # no title and shows up as an untitled text box (regression guard). The

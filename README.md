@@ -158,11 +158,15 @@ enforcement. API clients ignore status events entirely.
 
 The `status_unit` valve (filter-wide, with a per-user override in the user
 valves) picks the unit and precision of the amounts. It is a dropdown in the
-valve editor, with the explanation in the option labels. Two Open WebUI
+valve editor, with the explanation in the option labels. Three Open WebUI
 editor quirks shape it: a pydantic `Enum` field renders as an untitled text
-box (not a dropdown), and a select field's `description` is shown as the
+box (not a dropdown); a select field's `description` is shown as the
 dropdown's placeholder — i.e. duplicated as its first item — so select
-valves carry `{value, label}` options and no description:
+valves carry `{value, label}` options and no description; and Open WebUI
+always attaches a `UserValves` instance with field defaults to users who
+never saved their own, so the per-user override must default to None
+("Default" in the editor) rather than any unit, or it would permanently
+shadow the filter-wide valve:
 
 | Unit | Example | Use |
 |---|---|---|
