@@ -260,7 +260,12 @@ same instance.
 - **`query_credit_usage(user="", namespace="")`** — per-namespace summary of
   a user's consumption: total charged, token split (uncached/cached input,
   output, cache-hit rate), and credit totals for the session (5h), weekly,
-  and all-time windows. `user` accepts a user ID, email, or name. Names are
+  and all-time windows. The session and weekly lines each report usage as
+  `used of budget (percent)` against the tool's `credits_per_session` and
+  `sliding_window_credits` valves — keep them equal to the filter's valves
+  of the same names (the window-length valves too) for exact percentages,
+  or set a limit to None to report that window without a budget. `user`
+  accepts a user ID, email, or name. Names are
   resolved case-insensitively; an exact name match wins over substring
   siblings, and a name matching multiple users returns an error listing the
   candidates instead of guessing.

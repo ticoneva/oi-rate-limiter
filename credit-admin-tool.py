@@ -2,7 +2,7 @@
 title: Credit Usage Admin Tool
 author: Vinci Chow
 author_url: https://github.com/ticoneva
-version: 0.5.0
+version: 0.6.0
 license: MIT
 
 Admin-only companion to the Rate and Credit Limit Filter. Queries a user's
@@ -63,6 +63,22 @@ class Tools:
         credit_window_minutes: int = Field(
             default=10080,
             description="Weekly window to report against; must match the filter's valve for exact percentages.",
+        )
+        credits_per_session: Optional[int] = Field(
+            default=2000,
+            description=(
+                "Session-window credit budget to report usage against. Must "
+                "match the filter's valve of the same name for exact "
+                "percentages; None reports the window without a budget."
+            ),
+        )
+        sliding_window_credits: Optional[int] = Field(
+            default=10000,
+            description=(
+                "Weekly-window credit budget to report usage against. Must "
+                "match the filter's valve of the same name for exact "
+                "percentages; None reports the window without a budget."
+            ),
         )
 
     def __init__(self):
@@ -287,9 +303,17 @@ class Tools:
 
         now = time.time()
         windows = [
-            ("session (5h)", self.valves.session_window_minutes * 60),
-            ("week", self.valves.credit_window_minutes * 60),
-            ("all time", None),
+            (
+                "session (5h)",
+                self.valves.session_window_minutes * 60,
+                self.valves.credits_per_session,
+            ),
+            (
+                "week",
+                self.valves.credit_window_minutes * 60,
+                self.valves.sliding_window_credits,
+            ),
+            ("all time", None, None),
         ]
 
         namespaces = self._namespaces_for_user(r, user_id)
@@ -337,7 +361,7 @@ class Tools:
                     f"  manual adjustments: {len(adjustments)}, "
                     f"net {sign}{self._fmt(abs(net))} credits (included in the totals above)"
                 )
-            for label, win_secs in windows:
+            for label, win_secs, limit in windows:
                 if win_secs is None:
                     subset = parsed
                     reqs = requests
@@ -345,9 +369,16 @@ class Tools:
                     subset = [p for p in parsed if p[0] > now - win_secs]
                     reqs = [p for p in requests if p[0] > now - win_secs]
                 charged = sum(p[4] for p in subset)
-                lines.append(
-                    f"  {label}: {self._fmt(charged)} credits over {len(reqs)} requests"
-                )
+                summary = f"  {label}: {self._fmt(charged)} credits"
+                if limit is not None and limit > 0:
+                    # Mirror the filter's status-line phrasing so chat
+                    # answers match what users see on their requests.
+                    pct = charged / limit * 100
+                    summary += (
+                        f" of {self._fmt(limit)} budget ({pct:.1f}%)"
+                    )
+                summary += f" over {len(reqs)} requests"
+                lines.append(summary)
 
         return "\n".join(lines)
 

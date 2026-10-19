@@ -85,8 +85,8 @@ out = run(t.query_credit_usage(user="u1", __user__=admin()))
 check("query lists both namespaces", "[glm-5.3]" in out and "[qwen-3.5]" in out, out)
 check("total charged summed", "total charged: 64 credits" in out, out)
 check("token split reported", "100500 input (90000 cached, 90% hit rate)" in out, out)
-check("session window separates old/new", "session (5h): 64 credits over 2 requests" in out, out)
-check("week window same", "week: 64 credits over 2 requests" in out, out)
+check("session window separates old/new", "session (5h): 64 credits of 2000 budget (3.2%) over 2 requests" in out, out)
+check("week window same", "week: 64 credits of 10000 budget (0.6%) over 2 requests" in out, out)
 
 # namespace filter
 out = run(t.query_credit_usage(user="u1", namespace="qwen-3.5", __user__=admin()))
@@ -100,9 +100,43 @@ print("== 3. Old records fall out of windows ==")
 t = make_tool()
 add_record(t, "glm-5.3", "u1", 100, 0, 0, 7, age_secs=6 * 3600)  # 6h old
 out = run(t.query_credit_usage(user="u1", __user__=admin()))
-check("6h-old record outside 5h session", "session (5h): 0 credits over 0 requests" in out, out)
-check("6h-old record inside week", "week: 7 credits over 1 requests" in out, out)
+check("6h-old record outside 5h session", "session (5h): 0 credits of 2000 budget (0.0%) over 0 requests" in out, out)
+check("6h-old record inside week", "week: 7 credits of 10000 budget (0.1%) over 1 requests" in out, out)
 check("all-time keeps it", "all time: 7 credits over 1 requests" in out, out)
+
+print("== 3b. Window budgets in usage reports ==")
+t = make_tool()
+add_record(t, "glm-5.3", "u1", 10000, 90000, 5000, 34)
+add_record(t, "glm-5.3", "u1", 500, 0, 200, 30, age_secs=3)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "default budgets shown",
+    "session (5h): 64 credits of 2000 budget (3.2%) over 2 requests" in out
+    and "week: 64 credits of 10000 budget (0.6%) over 2 requests" in out,
+    out,
+)
+check("all-time has no budget line", "all time: 64 credits over 2 requests" in out, out)
+
+# custom budgets reflect the valves
+t.valves.credits_per_session = 100
+t.valves.sliding_window_credits = 640
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "custom budgets reported",
+    "session (5h): 64 credits of 100 budget (64.0%) over 2 requests" in out
+    and "week: 64 credits of 640 budget (10.0%) over 2 requests" in out,
+    out,
+)
+
+# None disables a budget; the window still reports usage
+t.valves.credits_per_session = None
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "None budget drops only the budget phrase",
+    "session (5h): 64 credits over 2 requests" in out
+    and "week: 64 credits of 640 budget" in out,
+    out,
+)
 
 print("== 4. Holds and in-flight keys ==")
 t = make_tool()
@@ -194,7 +228,7 @@ check("grant reports success", "Adjusted credits" in out and "+100" in out and "
 out = run(t.query_credit_usage(user="u1", namespace="glm-5.3", __user__=admin()))
 check("grant visible in ledger", "total charged: 130 credits" in out, out)
 check("adjustment line in report", "manual adjustments: 1, net +100 credits" in out, out)
-check("request count excludes adjustment", "week: 130 credits over 1 requests" in out, out)
+check("request count excludes adjustment", "week: 130 credits of 10000 budget (1.3%) over 1 requests" in out, out)
 out = run(t.query_credit_usage(user="u1", namespace="qwen-3.5", __user__=admin()))
 check("other namespace untouched", "total charged: 20 credits" in out, out)
 
