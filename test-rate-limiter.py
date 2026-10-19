@@ -1091,22 +1091,33 @@ if statuses:
 
 # valve spec shape: Open WebUI's editor renders a dropdown only from an
 # inline input.select config — a pydantic Enum serializes as a $ref with
-# no title and shows up as an untitled text box (regression guard)
+# no title and shows up as an untitled text box (regression guard). The
+# options must be {value, label} objects with NO field description: the
+# editor passes a select field's description as the dropdown's
+# placeholder, which renders as a duplicated first item.
 spec = mod_Filter_Valves_schema()
 su = spec["properties"]["status_unit"]
 check(
     "status_unit spec carries inline select options",
     su.get("input", {}).get("type") == "select"
-    and su["input"]["options"] == ["credits", "milli-credits", "raw"],
+    and [o["value"] for o in su["input"]["options"]]
+    == ["credits", "milli-credits", "raw"],
+    su,
+)
+check(
+    "select options carry explanatory labels",
+    all(isinstance(o, dict) and o.get("label") for o in su["input"]["options"]),
     su,
 )
 check("status_unit spec has a title", su.get("title") == "Status Unit", su)
+check("status_unit spec has no description (would duplicate in dropdown)", "description" not in su, su)
 uv = mod_Filter_UserValves_schema()["properties"]["status_unit"]
 check(
     "UserValves status_unit spec carries select options too",
     uv.get("input", {}).get("type") == "select" and uv.get("title"),
     uv,
 )
+check("UserValves status_unit spec has no description", "description" not in uv, uv)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

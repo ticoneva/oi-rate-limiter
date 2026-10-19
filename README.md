@@ -158,9 +158,11 @@ enforcement. API clients ignore status events entirely.
 
 The `status_unit` valve (filter-wide, with a per-user override in the user
 valves) picks the unit and precision of the amounts. It is a dropdown in the
-valve editor (a string valve with `json_schema_extra` select options — note
-that a pydantic `Enum` field does *not* render as a dropdown in Open WebUI's
-editor; it shows as an untitled text box):
+valve editor, with the explanation in the option labels. Two Open WebUI
+editor quirks shape it: a pydantic `Enum` field renders as an untitled text
+box (not a dropdown), and a select field's `description` is shown as the
+dropdown's placeholder — i.e. duplicated as its first item — so select
+valves carry `{value, label}` options and no description:
 
 | Unit | Example | Use |
 |---|---|---|

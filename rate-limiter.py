@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 1.1.1
+version: 1.1.2
 license: MIT
 """
 
@@ -182,21 +182,30 @@ class Filter:
         )
         status_unit: str = Field(
             default="credits",
-            description=(
-                "Unit and precision of the credits shown in the usage status "
-                "line. credits: whole credits (2 decimals below 100). "
-                "milli-credits: thousandths — precise enough to see a single "
-                "short prompt's effect. raw: the internal fractional credit "
-                "value without rounding."
-            ),
             # Open WebUI's valve editor renders a dropdown from this
             # json_schema_extra config — a pydantic Enum does NOT work: it
             # serializes as a $ref with no inline enum/title, which the
-            # editor shows as an untitled text box.
+            # editor shows as an untitled text box. No description either:
+            # the editor passes a select field's description as the
+            # dropdown's placeholder, which shows up as a duplicated first
+            # item — so the explanation lives in the option labels instead.
             json_schema_extra={
                 "input": {
                     "type": "select",
-                    "options": ["credits", "milli-credits", "raw"],
+                    "options": [
+                        {
+                            "value": "credits",
+                            "label": "credits — whole credits (2 decimals below 100)",
+                        },
+                        {
+                            "value": "milli-credits",
+                            "label": "milli-credits — thousandths; one short prompt is visible",
+                        },
+                        {
+                            "value": "raw",
+                            "label": "raw — unrounded fractional credits",
+                        },
+                    ],
                 }
             },
         )
@@ -222,15 +231,19 @@ class Filter:
         )
         status_unit: str = Field(
             default="credits",
-            description=(
-                "Unit shown in your usage status line: credits, "
-                "milli-credits (thousandths — one short prompt is visible), "
-                "or the raw fractional value."
-            ),
+            # No description — see the Valves comment above: the editor
+            # would show it as a duplicated first dropdown item.
             json_schema_extra={
                 "input": {
                     "type": "select",
-                    "options": ["credits", "milli-credits", "raw"],
+                    "options": [
+                        {"value": "credits", "label": "credits — whole credits"},
+                        {
+                            "value": "milli-credits",
+                            "label": "milli-credits — thousandths",
+                        },
+                        {"value": "raw", "label": "raw — unrounded value"},
+                    ],
                 }
             },
         )
