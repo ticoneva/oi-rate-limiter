@@ -1,7 +1,7 @@
 """
 title: Credit Usage Admin Tool
-author: Assistant
-author_url: https://github.com/ticoneva/oi-rate-limiter
+author: Vinci Chow
+author_url: https://github.com/ticoneva
 version: 0.5.0
 license: MIT
 

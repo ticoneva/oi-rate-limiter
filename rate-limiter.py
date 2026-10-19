@@ -1,7 +1,7 @@
 """
 title: Rate and Credit Limit Filter
-author: justinh-rahb with improvements by Yanyitin753
-author_url: https://github.com/justinh-rahb
+author: Vinci Chow
+author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
 version: 1.1.2
 license: MIT
