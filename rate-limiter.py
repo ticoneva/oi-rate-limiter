@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: justinh-rahb with improvements by Yanyitin753
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 1.0.0
+version: 1.1.0
 license: MIT
 """
 
@@ -12,8 +12,18 @@ import json
 import time
 import uuid
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Callable, Awaitable, Any, Optional, Tuple
 from pydantic import BaseModel, Field
+
+
+class StatusUnit(str, Enum):
+    """Display unit for the usage status line. The ledger always stores
+    fractional credits; this only affects presentation."""
+
+    CREDITS_2DP = "credits"
+    MILLI_CREDITS = "milli-credits"
+    RAW = "raw"
 
 
 class Filter:
@@ -170,6 +180,16 @@ class Filter:
             default=True,
             description="Whether rate limiting is enabled for admin users.",
         )
+        status_unit: StatusUnit = Field(
+            default=StatusUnit.CREDITS_2DP,
+            description=(
+                "Unit and precision of the credits shown in the usage status "
+                "line. credits: whole credits (2 decimals below 100). "
+                "milli-credits: thousandths — precise enough to see a single "
+                "short prompt's effect. raw: the internal fractional credit "
+                "value without rounding."
+            ),
+        )
         redis_url: str = Field(
             default="redis://redis-valkey:6379/0",
             description="Redis URL for shared rate limit tracking.",
@@ -189,6 +209,14 @@ class Filter:
             default=True,
             description="Show the credit usage status line on your requests. "
             "Limit enforcement is unaffected.",
+        )
+        status_unit: StatusUnit = Field(
+            default=StatusUnit.CREDITS_2DP,
+            description=(
+                "Unit shown in your usage status line: credits, "
+                "milli-credits (thousandths — one short prompt is visible), "
+                "or the raw fractional value."
+            ),
         )
 
     def __init__(self):
@@ -371,12 +399,15 @@ class Filter:
             retention = max(retention, self.valves.session_window_minutes * 60)
         return retention
 
-    def _sum_credits(self, key: str, start: float, end: float) -> int:
-        # Members are "{ts}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}"
-        total = 0
+    def _sum_credits(self, key: str, start: float, end: float) -> float:
+        # Members are "{ts}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}".
+        # Charges are fractional credits (full precision at write time), so
+        # many small requests accumulate exactly instead of each rounding
+        # away to zero. Legacy integer records parse identically.
+        total = 0.0
         for member in self._get_redis().zrangebyscore(key, start, end):
             try:
-                total += int(float(member.rsplit(":", 1)[1]))
+                total += float(member.rsplit(":", 1)[1])
             except (ValueError, IndexError):
                 continue
         return total
@@ -396,9 +427,10 @@ class Filter:
 
         # Holds are "{ts}:{uuid}:{amount}" with a key TTL bounding their life;
         # score-based pruning mirrors it in case the TTL has not fired yet.
+        # Hold amounts are fractional like charges.
         for member in self._get_redis().zrangebyscore(holds_key, now - win_secs, "+inf"):
             try:
-                used += int(float(member.rsplit(":", 1)[1]))
+                used += float(member.rsplit(":", 1)[1])
             except (ValueError, IndexError):
                 continue
         return used, earliest
@@ -440,12 +472,23 @@ class Filter:
                 remaining = room
         return remaining
 
-    def _charge_estimate(self, input_tokens: int) -> int:
-        """Credits reserved for a request at admission time."""
+    @staticmethod
+    def _fmt_charge(value: float) -> str:
+        """Ledger serialization for a credit amount: integer text when the
+        value is whole (matches the pre-fractional record format exactly),
+        else the full fractional value."""
+        if value == int(value):
+            return str(int(value))
+        return repr(value)
+
+    def _charge_estimate(self, input_tokens: int) -> float:
+        """Credits reserved for a request at admission time (fractional —
+        a short prompt reserves its true sub-credit cost instead of 0)."""
         output_reserve = max(0, self.valves.hold_output_reserve_tokens)
         return round(
             self.valves.input_weight * input_tokens
-            + self.valves.output_weight * output_reserve
+            + self.valves.output_weight * output_reserve,
+            6,
         )
 
     def _place_hold(self, user_id: str, model_id: str, estimate: int):
@@ -453,7 +496,7 @@ class Filter:
         key = self._holds_key(namespace, user_id)
 
         score = time.time()
-        member = f"{score}:{uuid.uuid4().hex}:{estimate}"
+        member = f"{score}:{uuid.uuid4().hex}:{self._fmt_charge(estimate)}"
 
         r = self._get_redis()
         with r.pipeline() as pipe:
@@ -487,14 +530,20 @@ class Filter:
 
         # Charge with this instance's weights at write time, so models with
         # different pricing can share one credit budget via rate_limiter_id.
+        # Full precision, not rounded: each request's sub-credit cost is kept
+        # so a burst of short prompts accumulates instead of each rounding
+        # away to zero (rounding happens only at display time). Six decimals
+        # bounds float noise; whole-credit charges serialize as integers so
+        # records are byte-identical to the pre-fractional format.
         charged = round(
             self.valves.input_weight * uncached
             + self.valves.cached_input_weight * cached
-            + self.valves.output_weight * output
+            + self.valves.output_weight * output,
+            6,
         )
 
         score = time.time()
-        member = f"{score}:{uuid.uuid4().hex}:{uncached}:{cached}:{output}:{charged}"
+        member = f"{score}:{uuid.uuid4().hex}:{uncached}:{cached}:{output}:{self._fmt_charge(charged)}"
 
         r = self._get_redis()
         with r.pipeline() as pipe:
@@ -576,19 +625,40 @@ class Filter:
         )
 
     @staticmethod
-    def _fmt_credits(n: float) -> str:
-        # Plain integers below 10K: with provider-style weights (z.ai
-        # multipliers / 10,000) each request charges single-digit credits,
-        # which K-notation at one decimal would round away entirely.
+    def _fmt_credits(n: float, unit: "StatusUnit" = StatusUnit.CREDITS_2DP) -> str:
+        """Format a credit amount in the chosen display unit. K/M notation
+        only applies at whole-credit precision — milli-credit and raw views
+        exist precisely to inspect small amounts, and K-notation would round
+        away the detail they are for."""
+        if unit == StatusUnit.RAW:
+            return f"{n:g}"
+        if unit == StatusUnit.MILLI_CREDITS:
+            mc = round(n * 1000)
+            if mc >= 1000000:
+                return f"{mc / 1000000:g}M mC"
+            if mc >= 10000:
+                return f"{mc / 1000:g}K mC"
+            return f"{mc} mC"
+        # Whole credits: zero as plain 0, integers above 100, two decimals
+        # below (light usage in fractional-credit land must stay visible),
+        # K/M at scale.
         if n >= 100000:
             return f"{n / 1000000:.1f}M"
         if n >= 10000:
             return f"{n / 1000:.0f}K"
-        return f"{n:.0f}"
+        if n >= 100 or n == 0:
+            return f"{n:.0f}"
+        return f"{n:.2f}"
 
     def _usage_status_message(
-        self, user_id: str, model_id: str, extra_credits: int = 0
+        self,
+        user_id: str,
+        model_id: str,
+        extra_credits: float = 0,
+        unit: Optional["StatusUnit"] = None,
     ) -> str:
+        if unit is None:
+            unit = self.valves.status_unit
         now = time.time()
         parts = []
         for label, limit, win_secs in (
@@ -611,7 +681,8 @@ class Filter:
             # One decimal throughout: with provider-scaled weights each
             # request moves the percentage by well under a whole point.
             parts.append(
-                f"{self._fmt_credits(used)}/{self._fmt_credits(limit)} {label} ({pct:.1f}%)"
+                f"{self._fmt_credits(used, unit)}/{self._fmt_credits(limit, unit)} "
+                f"{label} ({pct:.1f}%)"
             )
         if not parts:
             return "Credits: no limits configured"
@@ -651,21 +722,38 @@ class Filter:
         # request's input estimate).
         divisor = self.valves.chars_per_token or 3.0
         est_tokens = int(state[0] / divisor)
-        extra = round(self.valves.output_weight * est_tokens)
+        extra = self.valves.output_weight * est_tokens
 
-        message = self._usage_status_message(
-            __user__["id"],
-            __model__["id"] if __model__ is not None else "default_model",
-            extra,
-        )
         user_valves = __user__.get("valves")
         if user_valves is not None and not getattr(
             user_valves, "show_usage_status", True
         ):
             return
+        message = self._usage_status_message(
+            __user__["id"],
+            __model__["id"] if __model__ is not None else "default_model",
+            extra,
+            self._user_status_unit(__user__),
+        )
         await emitter(
             {"type": "status", "data": {"description": message, "done": False}}
         )
+
+    def _user_status_unit(self, __user__: dict) -> Optional["StatusUnit"]:
+        """The user's status-unit preference when set, else the filter valve.
+        A user valve that fails to parse falls back to the valve value."""
+        user_valves = __user__.get("valves")
+        if user_valves is None:
+            return None
+        raw = getattr(user_valves, "status_unit", None)
+        if raw is None:
+            return None
+        if isinstance(raw, StatusUnit):
+            return raw
+        try:
+            return StatusUnit(raw)
+        except ValueError:
+            return None
 
     def _clear_live_status(self, __user__: dict, __metadata__: Optional[dict]):
         metadata = __metadata__ or {}
@@ -682,7 +770,7 @@ class Filter:
         __user__: dict,
         user_id: str,
         model_id: str,
-        extra_credits: int = 0,
+        extra_credits: float = 0,
     ):
         if __event_emitter__ is None:
             return
@@ -697,7 +785,10 @@ class Filter:
                     "type": "status",
                     "data": {
                         "description": self._usage_status_message(
-                            user_id, model_id, extra_credits
+                            user_id,
+                            model_id,
+                            extra_credits,
+                            self._user_status_unit(__user__),
                         ),
                         "done": True,
                     },
@@ -767,7 +858,7 @@ class Filter:
                 )
                 if credit_limited:
                     raise Exception(
-                        f"Credit limit exceeded. You have used {used_credits} of {credit_limit} credits on model '{model_id}'. Please try again at {self._retry_time(credit_wait)}."
+                        f"Credit limit exceeded. You have used {used_credits:.1f} of {credit_limit} credits on model '{model_id}'. Please try again at {self._retry_time(credit_wait)}."
                     )
 
             self._admit_inflight(user_id, model_id, metadata)

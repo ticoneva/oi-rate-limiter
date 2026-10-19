@@ -2,7 +2,7 @@
 title: Credit Usage Admin Tool
 author: Assistant
 author_url: https://github.com/ticoneva/oi-rate-limiter
-version: 0.4.0
+version: 0.5.0
 license: MIT
 
 Admin-only companion to the Rate and Credit Limit Filter. Queries a user's
@@ -145,8 +145,10 @@ class Tools:
     def _member_usage(member: str):
         """Parse '{ts}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}'.
         Returns (ts, uncached, cached, out, charged, is_adjustment) or None.
-        Manual adjustments written by adjust_credit_usage use a
-        'adj-{reason}' uuid segment and 0 token counts."""
+        charged is fractional (float) since filter v1.1.0; legacy integer
+        records parse identically. Manual adjustments written by
+        adjust_credit_usage use an 'adj-{reason}' uuid segment and 0 token
+        counts."""
         parts = member.split(":")
         if len(parts) != 6:
             return None
@@ -156,7 +158,7 @@ class Tools:
                 int(parts[2]),
                 int(parts[3]),
                 int(parts[4]),
-                int(parts[5]),
+                float(parts[5]),
                 parts[1].startswith("adj-"),
             )
         except ValueError:
@@ -168,6 +170,15 @@ class Tools:
         if not __user__ or __user__.get("role") != "admin":
             return "Error: this tool is restricted to administrators."
         return None
+
+    @staticmethod
+    def _fmt(amount: float) -> str:
+        """Credit amounts are fractional since filter v1.1.0. Show two
+        decimals, dropping the fraction for whole-credit totals so legacy
+        records report exactly as before."""
+        if abs(amount - round(amount)) < 1e-9:
+            return f"{round(amount):d}"
+        return f"{amount:.2f}"
 
     @staticmethod
     def _caller_is_admin(__user__: Optional[dict]) -> bool:
@@ -313,7 +324,7 @@ class Tools:
 
             lines.append(f"\n[{ns}]")
             lines.append(
-                f"  records: {len(parsed)}, total charged: {total_charged} credits"
+                f"  records: {len(parsed)}, total charged: {self._fmt(total_charged)} credits"
             )
             lines.append(
                 f"  tokens: {total_in} input ({total_cached} cached, "
@@ -321,9 +332,10 @@ class Tools:
             )
             if adjustments:
                 net = sum(p[4] for p in adjustments)
+                sign = "+" if net >= 0 else "-"
                 lines.append(
                     f"  manual adjustments: {len(adjustments)}, "
-                    f"net {net:+d} credits (included in the totals above)"
+                    f"net {sign}{self._fmt(abs(net))} credits (included in the totals above)"
                 )
             for label, win_secs in windows:
                 if win_secs is None:
@@ -334,7 +346,7 @@ class Tools:
                     reqs = [p for p in requests if p[0] > now - win_secs]
                 charged = sum(p[4] for p in subset)
                 lines.append(
-                    f"  {label}: {charged} credits over {len(reqs)} requests"
+                    f"  {label}: {self._fmt(charged)} credits over {len(reqs)} requests"
                 )
 
         return "\n".join(lines)

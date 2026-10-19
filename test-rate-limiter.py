@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import uuid
 
 import fakeredis
 import pydantic
@@ -752,10 +753,12 @@ f2.valves.credits_per_session = 2000
 run_stream(f2, vllm_final_chunk_dict(prompt_tokens=100000, completion_tokens=5000, cached_tokens=90000))
 key = [k for k in f2._get_redis().keys() if k.endswith(":credits")][0]
 members = f2._get_redis().zrange(key, 0, -1)
-# z.ai: (10000*6.9 + 90000*1.7 + 5000*24)/10000 = 34.0 credits
+# z.ai: (10000*6.9 + 90000*1.7 + 5000*24)/10000 = 34.2 credits — the
+# fractional ledger keeps the true value (the old integer rounding
+# recorded 34, undercharging by 0.2)
 check(
-    "z.ai formula reproduced: 34 credits",
-    members[0].rsplit(":", 1)[1] == "34",
+    "z.ai formula reproduced: 34.2 credits",
+    members[0].rsplit(":", 1)[1] == "34.2",
     members[0],
 )
 
@@ -938,6 +941,130 @@ if statuses:
     check(
         "refreshed status shows recorded usage",
         statuses[0]["data"]["description"] == "Credits: 150/2000 session (7.5%)",
+        statuses[0]["data"]["description"],
+    )
+
+print("== 31. Fractional credit accounting (no rounding to zero) ==")
+# A short prompt under default-style weights costs a fraction of a credit;
+# it must be recorded, not rounded away.
+f = make_filter(
+    sliding_window_credits=10000,
+    input_weight=0.00069, cached_input_weight=0.00017, output_weight=0.0024,
+)
+# "Are you there?" shaped request: 100 fresh in, 0 cached, 30 out
+run_inlet(f, {"stream": True, "messages": []})
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=30))
+key = [k for k in f._get_redis().keys() if k.endswith(":credits")][0]
+member = f._get_redis().zrange(key, 0, -1)[0]
+# 100*0.00069 + 30*0.0024 = 0.141 credits
+check(
+    "short prompt records fractional charge 0.141",
+    member.rsplit(":", 1)[1] == "0.141",
+    member,
+)
+# repeat 8 times: total 8 x 0.141 = 1.128, accumulated exactly
+for i in range(7):
+    run_inlet(f, {"stream": True, "messages": []})
+    run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=30))
+used, _ = f._used_with_holds("u1", "glm-5.3", time.time(), 7 * 86400)
+check("fractional charges accumulate (1.128 not 0)", abs(used - 1.128) < 1e-9, used)
+
+# legacy integer records still parse
+f._get_redis().zadd(key, {f"{time.time()}:{uuid.uuid4().hex}:1:0:1:5": time.time()})
+used2, _ = f._used_with_holds("u1", "glm-5.3", time.time(), 7 * 86400)
+check("legacy integer records coexist (6.128)", abs(used2 - 6.128) < 1e-9, used2)
+
+# a burst of zero-cost-under-old-rounding prompts exhausts a small budget
+f2 = make_filter(
+    sliding_window_credits=1,
+    input_weight=0.00069, cached_input_weight=0.00017, output_weight=0.0024,
+)
+blocked = None
+for i in range(10):
+    try:
+        run_inlet(f2, {"stream": True, "messages": []})
+        run_stream(f2, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=30))
+    except Exception as e:
+        blocked = "Credit limit exceeded" in str(e)
+        break
+check("short-prompt spam now exhausts a 1-credit budget", blocked is not None and blocked, blocked)
+
+print("== 32. Status unit dropdown (credits / milli-credits / raw) ==")
+f = make_filter(
+    credits_per_session=2000, sliding_window_credits=10000,
+    input_weight=0.00069, cached_input_weight=0.00017, output_weight=0.0024,
+    show_usage_status=True,
+)
+# one short prompt: 0.141 credits
+run_inlet(f, {"stream": True, "messages": []})
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=30))
+
+# default (credits, 2dp below 100)
+msg = f._usage_status_message("u1", "glm-5.3")
+check(
+    "default unit: 2dp below 100",
+    msg == "Credits: 0.14/2000 session (0.0%) - 0.14/10K week (0.0%)",
+    msg,
+)
+
+# milli-credits
+msg = f._usage_status_message("u1", "glm-5.3", unit=_mod.StatusUnit.MILLI_CREDITS)
+check(
+    "milli-credit unit shows thousandths",
+    msg == "Credits: 141 mC/2M mC session (0.0%) - 141 mC/10M mC week (0.0%)",
+    msg,
+)
+
+# raw
+msg = f._usage_status_message("u1", "glm-5.3", unit=_mod.StatusUnit.RAW)
+check(
+    "raw unit shows unrounded value",
+    msg == "Credits: 0.141/2000 session (0.0%) - 0.141/10000 week (0.0%)",
+    msg,
+)
+
+# whole-credit formatting at scale: +500000 in, +100000 out -> +585 credits
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=500000, completion_tokens=100000))
+msg = f._usage_status_message("u1", "glm-5.3")
+check(
+    "credits unit: integers at 100+",
+    msg.startswith("Credits: 585/2000 session ("),
+    msg,
+)
+
+# user valve override: milli-credits for this user only
+class UserValvesStub2:
+    show_usage_status = True
+    status_unit = _mod.StatusUnit.MILLI_CREDITS
+
+emitter = TestEventEmitter()
+run_inlet(
+    f, {"stream": True, "messages": []}, emitter=emitter,
+    u={"id": "u1", "role": "user", "valves": UserValvesStub2()},
+)
+statuses = [e for e in emitter.events if e.get("type") == "status"]
+if statuses:
+    check(
+        "user valve overrides status unit",
+        "mC" in statuses[0]["data"]["description"],
+        statuses[0]["data"]["description"],
+    )
+
+# unparseable user valve falls back to the filter valve
+class UserValvesStub3:
+    show_usage_status = True
+    status_unit = "bogus"
+
+emitter = TestEventEmitter()
+run_inlet(
+    f, {"stream": True, "messages": []}, emitter=emitter,
+    u={"id": "u1", "role": "user", "valves": UserValvesStub3()},
+)
+statuses = [e for e in emitter.events if e.get("type") == "status"]
+if statuses:
+    check(
+        "bogus user valve falls back to filter valve",
+        "mC" not in statuses[0]["data"]["description"],
         statuses[0]["data"]["description"],
     )
 

@@ -30,7 +30,7 @@ Typical coding scenarios:
 
 | Scenario | ~Credits |
 |---|---|
-| Quick chat question (few hundred tokens) | 0 (rounds away) |
+| Quick chat question (few hundred tokens) | ~0.1–0.3 (fractional, accumulates) |
 | One coding exchange in a warm session (10K cached context + 800 output) | 3–4 |
 | Fresh 100K-token context (new repo, first read) | ~70 |
 | Heavy agentic hour (~150 calls × 8 credits) | ~1,200 |
@@ -63,6 +63,11 @@ credits = input_weight       × (prompt_tokens - cached_tokens)   (uncached pref
 This mirrors how prefill and decode are priced differently in practice, and
 lets cache hits be discounted. Set all weights to `1.0` (the default) and the
 budget is a plain total-token limit.
+
+Charges are stored **fractionally** (full precision, 6 decimals) — a short
+prompt that costs 0.141 credits records 0.141, so many small requests
+accumulate exactly instead of each rounding away to zero. Rounding happens
+only at display time, and the budget comparison uses the exact sum.
 
 Because credits are charged with each filter instance's own weights **at write
 time**, models with different pricing can share one budget via the same
@@ -151,6 +156,15 @@ content), and is refreshed after a web-UI turn completes. Users can hide the
 line for themselves via the filter's user valves — hiding it does not affect
 enforcement. API clients ignore status events entirely.
 
+The `status_unit` valve (filter-wide, with a per-user override in the user
+valves) picks the unit and precision of the amounts:
+
+| Unit | Example | Use |
+|---|---|---|
+| `credits` (default) | `0.14/2000 session` | Whole credits; two decimals below 100 so light usage is still visible |
+| `milli-credits` | `141 mC/2M mC session` | Thousandths — a single short prompt's effect is visible; for debugging |
+| `raw` | `0.141/2000 session` | The unrounded fractional value |
+
 To discount cache hits, vLLM must be started with
 `--enable-prompt-tokens-details` so usage includes
 `prompt_tokens_details.cached_tokens`. When the field is absent (other
@@ -181,6 +195,7 @@ the same field).
 | `hold_output_reserve_tokens` | 0 | Decode tokens reserved per hold, on top of the input estimate |
 | `hold_ttl_minutes` | 15 | Lifespan of a hold whose request never reports usage |
 | `show_usage_status` | False | Emit a status line at request time showing credit consumption per session/window |
+| `status_unit` | credits | Display unit in the status line: credits, milli-credits (thousandths), or raw |
 | `status_interval_seconds` | 5 | Minimum interval between live status updates during streaming |
 | `enabled_for_admins` | True | Whether admins are also rate-limited |
 | `redis_url` | `redis://redis-valkey:6379/0` | Redis connection URL |
