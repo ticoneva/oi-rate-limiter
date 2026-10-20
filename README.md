@@ -103,7 +103,9 @@ use unique members and are released FIFO. Two smaller caveats: admission
 check-then-add is not atomic, so a burst of near-simultaneous inlets can
 exceed the cap by one or two (the same accepted race the credit holds have);
 and API-path release relies on Open WebUI's `ENABLE_API_OUTLET_FILTERS`
-(default on) — without it, API slots are recovered solely by the silence TTL.
+(v0.11+ only, default on; v0.9.x has no API outlet at all) — without it,
+API slots are recovered solely by the stream hook's usage-bearing final
+chunk or the silence TTL.
 The admin tool's `clear_credit_usage` also deletes in-flight slots, the
 manual escape hatch if a user ever reports being stuck.
 
@@ -120,6 +122,15 @@ manual escape hatch if a user ever reports being stuck.
 The filter injects `stream_options: {include_usage: true}` into streaming
 requests so OpenAI-compatible backends (vLLM, etc.) report usage in the final
 chunk; a client-supplied `stream_options` is preserved.
+
+It also strips an empty `tools: []` from request bodies. Open WebUI's
+Anthropic-compatible endpoint (`/api/v1/messages`, used by Claude Code)
+passes the array through to OpenAI-compatible backends, which reject it
+with a 400 *after* the request was admitted — leaking an in-flight slot
+(until the silence TTL) and a credit hold (until `hold_ttl_minutes`).
+Claude Code's background helper calls (topic/command detection) are the
+known trigger; an empty tools list is semantically identical to no tools,
+so removing it is always safe.
 
 ### Admission control (holds)
 
