@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: Vinci Chow
 author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
-version: 1.1.3
+version: 1.1.4
 license: MIT
 """
 
@@ -874,6 +874,21 @@ class Filter:
         __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> dict:
+        # Strip `tools: []` (and a then-dangling tool_choice) before the
+        # enforcement gate: Open WebUI's Anthropic->OpenAI conversion
+        # passes Claude Code helper-call `tools: []` through, and
+        # OpenAI-compatible backends (vLLM, OpenAI) reject the empty array
+        # with a 400 AFTER this filter admitted the request — leaking an
+        # in-flight slot for the silence TTL and a credit hold for
+        # hold_ttl. An empty tools list is semantically identical to no
+        # tools. Payload hygiene, so it runs even for users the limiter
+        # does not enforce on.
+        tools = body.get("tools")
+        if isinstance(tools, list) and not tools:
+            del body["tools"]
+            if "tool_choice" in body:
+                del body["tool_choice"]
+
         if self._enforced_for(__user__):
             user_id = __user__["id"]
             model_id = __model__["id"] if __model__ is not None else "default_model"

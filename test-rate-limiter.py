@@ -4,8 +4,8 @@ Covers: the concurrency limit (admission, release on stream/outlet, marker
 dedup, liveness refresh, silence expiry, FIFO fallback for bare API calls,
 shared namespaces), credit budgets, weight math, cache-hit discount,
 stream-hook formats (dict / raw SSE bytes), outlet dedup via done markers,
-non-streaming input estimation, max_tokens capping, and multi-worker
-consistency via fakeredis shared state.
+non-streaming input estimation, max_tokens capping, empty-tools payload
+hygiene, and multi-worker consistency via fakeredis shared state.
 
 Run: python3 test-rate-limiter.py
 """
@@ -1145,6 +1145,57 @@ check(
     uv,
 )
 check("UserValves status_unit spec has no description", "description" not in uv, uv)
+
+print("== 33. Empty tools strip (Anthropic helper-call hygiene) ==")
+# Claude Code's background helper calls (topic/command detection) carry
+# `tools: []`; Open WebUI's Anthropic->OpenAI conversion passes the empty
+# array through and vLLM 400s on it — after admission, so the slot and hold
+# leak until their TTLs. The filter must strip it in inlet, before the
+# request reaches the backend.
+f = make_filter()
+body = {
+    "model": "glm-5.3",
+    "stream": True,
+    "max_tokens": 100,
+    "system": "Generate a short title.",
+    "tools": [],
+    "messages": [{"role": "user", "content": "Conversation about coral reefs."}],
+}
+run_inlet(f, body)
+check("empty tools stripped", "tools" not in body, body)
+check(
+    "rest of body intact",
+    body.get("system") == "Generate a short title."
+    and body["messages"][0]["content"] == "Conversation about coral reefs.",
+    body,
+)
+
+body = {"stream": True, "messages": [], "tools": [], "tool_choice": "auto"}
+run_inlet(f, body)
+check("empty tools stripped (bare shape)", "tools" not in body, body)
+check("dangling tool_choice stripped too", "tool_choice" not in body, body)
+
+body = {
+    "stream": True,
+    "messages": [],
+    "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+    "tool_choice": "auto",
+}
+run_inlet(f, body)
+check("non-empty tools preserved", len(body.get("tools") or []) == 1, body)
+check("tool_choice preserved alongside tools", body.get("tool_choice") == "auto", body)
+
+# The strip is payload hygiene, not rate limiting: it must run even for
+# users the limiter does not enforce on (the backend 400 would leak nothing
+# for them, but the request still fails needlessly).
+f = make_filter(enabled_for_admins=False)
+body = {"stream": True, "messages": [], "tools": []}
+run_inlet(f, body, u=user("admin_strip", role="admin"))
+check("strip applies when limiting disabled for user", "tools" not in body, body)
+
+body = {"stream": True, "messages": [], "tools": []}
+asyncio.run(f.inlet(body, TestEventEmitter()))
+check("strip applies with no user at all", "tools" not in body, body)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")
