@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: Vinci Chow
 author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
-version: 1.1.4
+version: 1.2.0
 license: MIT
 """
 
@@ -288,6 +288,13 @@ class Filter:
     ) -> str:
         return f"oi-rate-limiter:{namespace}:{user_id}:done:{chat_id}:{message_id}"
 
+    @staticmethod
+    def _est_marker_key(namespace: str, user_id: str, turn_id: str) -> str:
+        """Marker mapping a bare API turn to the credit record holding its
+        inlet-time input estimate, so an outlet invocation can replace the
+        estimate with exact usage instead of double-charging."""
+        return f"oi-rate-limiter:{namespace}:{user_id}:est:{turn_id}"
+
     def _get_namespace(self, model_id: str) -> str:
         ns = self.valves.rate_limiter_id.strip()
         return ns if ns else model_id
@@ -310,12 +317,17 @@ class Filter:
         """The zset member identifying one in-flight request. When the
         caller's metadata carries chat and message ids the member is
         reconstructible in the stream/outlet hooks, enabling exact release
-        and liveness refresh. Bare API calls have neither, so they fall
-        back to a unique member released FIFO."""
+        and liveness refresh. Bare API calls carry the turn id the inlet
+        minted and stashed into the request-scoped metadata dict (member
+        'api:{turn_id}') — also exactly reconstructible. Neither present ->
+        None, and the caller falls back to unique-member FIFO release."""
         metadata = metadata or {}
         chat_id, message_id = metadata.get("chat_id"), metadata.get("message_id")
         if chat_id and message_id:
             return f"{chat_id}:{message_id}"
+        turn_id = metadata.get("oi_rate_limiter_turn_id")
+        if turn_id:
+            return f"api:{turn_id}"
         return None
 
     def _concurrency_limited(
@@ -341,12 +353,19 @@ class Filter:
 
     def _admit_inflight(self, user_id: str, model_id: str, metadata: Optional[dict]):
         """Take an in-flight slot for this request. The member is the turn's
-        (chat_id, message_id) when known, else a unique fallback."""
+        (chat_id, message_id) when known. Bare API calls get a per-request
+        turn id instead, stashed into the request-scoped metadata dict so
+        the stream/outlet hooks can reconstruct the member exactly; without
+        a metadata dict to stash into, the member is opaque (FIFO
+        release)."""
         namespace = self._get_namespace(model_id)
         key = self._inflight_key(namespace, user_id)
-        member = self._inflight_member(metadata) or (
-            f"{time.time()}:{uuid.uuid4().hex}"
-        )
+        member = self._inflight_member(metadata)
+        if member is None:
+            turn_id = uuid.uuid4().hex
+            if isinstance(metadata, dict):
+                metadata["oi_rate_limiter_turn_id"] = turn_id
+            member = f"api:{turn_id}"
         score = time.time()
 
         r = self._get_redis()
@@ -554,7 +573,7 @@ class Filter:
         input_tokens: int,
         cached_tokens: int,
         output_tokens: int,
-    ) -> int:
+    ) -> str:
         namespace = self._get_namespace(model_id)
         key = self._credit_key(namespace, user_id)
 
@@ -585,7 +604,9 @@ class Filter:
             pipe.expire(key, self._credit_retention_secs())
             pipe.execute()
         self._release_hold(user_id, model_id)
-        return charged
+        # The record's member, so callers that later learn exact usage can
+        # supersede this record instead of double-charging.
+        return member
 
     @staticmethod
     def _extract_usage(usage: Any) -> Tuple[int, int, int]:
@@ -892,7 +913,10 @@ class Filter:
         if self._enforced_for(__user__):
             user_id = __user__["id"]
             model_id = __model__["id"] if __model__ is not None else "default_model"
-            metadata = __metadata__ or {}
+            # Keep the caller's dict by reference even when empty: the turn
+            # id stashed by _admit_inflight must be visible to the stream
+            # and outlet hooks, which receive the same request-scoped dict.
+            metadata = __metadata__ if __metadata__ is not None else {}
 
             concurrency_limited, wait_time, in_flight = self._concurrency_limited(
                 user_id, model_id
@@ -950,7 +974,22 @@ class Filter:
             elif self.valves.estimate_nonstreaming_tokens and not is_web_ui:
                 estimate = self._estimate_input_tokens(body)
                 if estimate > 0:
-                    self._record_usage(user_id, model_id, estimate, 0, 0)
+                    member = self._record_usage(user_id, model_id, estimate, 0, 0)
+                    # Remember which record holds this turn's estimate: when
+                    # an outlet invocation later reports exact usage (Open
+                    # WebUI v0.12+ with ENABLE_API_OUTLET_FILTERS), it
+                    # replaces the estimate instead of double-charging.
+                    # Without an outlet the marker just expires alongside
+                    # the record it points at.
+                    turn_id = metadata.get("oi_rate_limiter_turn_id")
+                    if turn_id:
+                        self._get_redis().set(
+                            self._est_marker_key(
+                                self._get_namespace(model_id), user_id, turn_id
+                            ),
+                            member,
+                            ex=self._credit_retention_secs(),
+                        )
 
             if self.valves.cap_max_tokens_to_budget and self._credit_limits_configured():
                 self._cap_max_tokens(body, user_id, model_id)
@@ -1058,10 +1097,15 @@ class Filter:
             metadata = __metadata__ or {}
             chat_id = metadata.get("chat_id")
             message_id = metadata.get("message_id")
+            turn_id = metadata.get("oi_rate_limiter_turn_id")
+            namespace = self._get_namespace(model_id)
             if chat_id and message_id:
-                marker = self._done_marker_key(
-                    self._get_namespace(model_id), user_id, chat_id, message_id
-                )
+                marker = self._done_marker_key(namespace, user_id, chat_id, message_id)
+                self._get_redis().set(marker, "1", ex=900)
+            elif turn_id:
+                # Bare API turn: keyed on the inlet-minted turn id, which
+                # an outlet invocation (Open WebUI v0.12+) can match.
+                marker = self._done_marker_key(namespace, user_id, "api-turn", turn_id)
                 self._get_redis().set(marker, "1", ex=900)
         except Exception as e:
             print(f"rate-limiter: failed to record stream usage: {e}")
@@ -1074,11 +1118,20 @@ class Filter:
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
     ) -> dict:
         """Record exact usage for non-streaming web UI turns, as a fallback
         for turns the stream hook did not already account for. Also frees
         the turn's in-flight slot — the primary release path when credits
-        are disabled or the stream never reported usage."""
+        are disabled or the stream never reported usage.
+
+        Open WebUI v0.12+ can invoke the outlet for bare API calls too
+        (ENABLE_API_OUTLET_FILTERS). Those turns carry no chat/message ids
+        in the body; they are identified by the turn id the inlet stashed
+        into the request-scoped metadata dict. Turns with no reconstructible
+        identity at all are left alone — the silence TTL remains their
+        backstop, because a blind FIFO release could free a different live
+        request's slot."""
         if not self._enforced_for(__user__):
             return body
 
@@ -1088,12 +1141,23 @@ class Filter:
 
         chat_id = body.get("chat_id")
         message_id = body.get("id")
+        turn_id = (__metadata__ or {}).get("oi_rate_limiter_turn_id")
+
         already_recorded = False
         if chat_id and message_id:
             try:
                 already_recorded = bool(
                     self._get_redis().exists(
                         self._done_marker_key(namespace, user_id, chat_id, message_id)
+                    )
+                )
+            except Exception:
+                return body
+        elif turn_id:
+            try:
+                already_recorded = bool(
+                    self._get_redis().exists(
+                        self._done_marker_key(namespace, user_id, "api-turn", turn_id)
                     )
                 )
             except Exception:
@@ -1109,11 +1173,21 @@ class Filter:
 
         # Turn finished without the stream hook accounting it — release the
         # in-flight slot now (marker-gated by `already_recorded` above, so a
-        # stream-accounted turn released there cannot double-release).
-        try:
-            self._release_inflight(user_id, model_id, {"chat_id": chat_id, "message_id": message_id})
-        except Exception as e:
-            print(f"rate-limiter: in-flight release failed: {e}")
+        # stream-accounted turn released there cannot double-release), but
+        # only when the turn's member is reconstructible.
+        if (chat_id and message_id) or turn_id:
+            try:
+                self._release_inflight(
+                    user_id,
+                    model_id,
+                    {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "oi_rate_limiter_turn_id": turn_id,
+                    },
+                )
+            except Exception as e:
+                print(f"rate-limiter: in-flight release failed: {e}")
 
         if not self._credit_limits_configured():
             return body
@@ -1136,7 +1210,26 @@ class Filter:
             return body
 
         try:
+            # A bare API turn may carry the inlet's non-streaming input
+            # estimate as a credit record; exact usage supersedes it, so
+            # remove that record before charging the real one.
+            if turn_id and not (chat_id and message_id):
+                est_key = self._est_marker_key(namespace, user_id, turn_id)
+                est_member = self._get_redis().get(est_key)
+                if est_member:
+                    self._get_redis().zrem(
+                        self._credit_key(namespace, user_id), est_member
+                    )
+                    self._get_redis().delete(est_key)
             self._record_usage(user_id, model_id, input_tokens, cached_tokens, output_tokens)
+            # Mark the turn accounted so a repeated outlet invocation (or a
+            # late-arriving usage-bearing chunk) cannot double-charge it.
+            if turn_id and not (chat_id and message_id):
+                self._get_redis().set(
+                    self._done_marker_key(namespace, user_id, "api-turn", turn_id),
+                    "1",
+                    ex=900,
+                )
         except Exception as e:
             print(f"rate-limiter: failed to record outlet usage: {e}")
 

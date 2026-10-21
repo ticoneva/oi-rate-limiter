@@ -94,7 +94,7 @@ def run_inlet(f, body, metadata=None, model=MODEL, u=None, emitter=None):
             emitter if emitter is not None else TestEventEmitter(),
             __user__=u or user(),
             __model__=model,
-            __metadata__=metadata or {},
+            __metadata__=metadata if metadata is not None else {},
         )
     )
 
@@ -106,14 +106,21 @@ def run_stream(f, chunk, metadata=None, model=MODEL, u=None, emitter=None):
             __event_emitter__=emitter,
             __user__=u or user(),
             __model__=model,
-            __metadata__=metadata or {},
+            __metadata__=metadata if metadata is not None else {},
         )
 
     return asyncio.run(_call())
 
 
-def run_outlet(f, body, model=MODEL, u=None):
-    return asyncio.run(f.outlet(body, __user__=u or user(), __model__=model))
+def run_outlet(f, body, model=MODEL, u=None, metadata=None):
+    return asyncio.run(
+        f.outlet(
+            body,
+            __user__=u or user(),
+            __model__=model,
+            __metadata__=metadata if metadata is not None else {},
+        )
+    )
 
 
 def vllm_final_chunk(prompt_tokens, completion_tokens, cached_tokens=None):
@@ -464,13 +471,13 @@ check(
 
 print("== 17. In-flight key format (bare API call) ==")
 f = make_filter()
-run_inlet(f, {"messages": []})  # no chat/message ids -> uuid fallback member
+meta = {}
+run_inlet(f, {"messages": []}, metadata=meta)  # no chat/message ids -> turn-id member
 key = "oi-rate-limiter:glm-5.3:u1:inflight"
 members = f._get_redis().zrange(key, 0, -1)
 check(
-    "uuid fallback member with timestamp",
-    len(members) == 1 and members[0].split(":")[1].strip() != ""
-    and len(members[0].split(":")) == 2,
+    "api turn-id member, stashed in metadata",
+    len(members) == 1 and members[0] == f"api:{meta.get('oi_rate_limiter_turn_id')}",
     members,
 )
 check("in-flight key has TTL", 0 < f._get_redis().ttl(key) <= 5 * 60, f._get_redis().ttl(key))
@@ -1196,6 +1203,132 @@ check("strip applies when limiting disabled for user", "tools" not in body, body
 body = {"stream": True, "messages": [], "tools": []}
 asyncio.run(f.inlet(body, TestEventEmitter()))
 check("strip applies with no user at all", "tools" not in body, body)
+
+print("== 34. API turn identity (v0.12 ENABLE_API_OUTLET_FILTERS semantics) ==")
+# a) inlet mints a turn id, stashes it in the request-scoped metadata dict,
+#    and uses it as the in-flight member
+f = make_filter(max_concurrent_requests=2, sliding_window_credits=100000)
+meta = {}
+run_inlet(f, {"stream": True, "messages": []}, metadata=meta)
+turn_id = meta.get("oi_rate_limiter_turn_id")
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+check("inlet stashes turn id in metadata", bool(turn_id), meta)
+check(
+    "member is api:{turn_id}",
+    f._get_redis().zrange(key, 0, -1) == [f"api:{turn_id}"],
+    f._get_redis().zrange(key, 0, -1),
+)
+
+# b) a usage-bearing chunk releases the slot exactly (not FIFO) and marks
+#    the turn accounted
+run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=10), metadata=meta)
+check("stream releases api slot exactly", f._get_redis().zcard(key) == 0)
+check(
+    "turn done marker set",
+    f._get_redis().exists(f"oi-rate-limiter:glm-5.3:u1:done:api-turn:{turn_id}"),
+)
+
+# c) an outlet invocation for the same turn must not double-charge
+run_outlet(
+    f,
+    {
+        "model": "glm-5.3",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "x",
+                "usage": {"input_tokens": 100, "output_tokens": 10},
+            }
+        ],
+    },
+    metadata=meta,
+)
+credit_key = "oi-rate-limiter:glm-5.3:u1:credits"
+check("stream + outlet = single record", f._get_redis().zcard(credit_key) == 1)
+
+# d) outlet without a stream record: exact charge, slot release, idempotent
+f = make_filter(sliding_window_credits=100000)
+meta = {}
+run_inlet(f, {"stream": True, "messages": []}, metadata=meta)
+outlet_body = {
+    "model": "glm-5.3",
+    "messages": [
+        {
+            "role": "assistant",
+            "content": "x",
+            "usage": {"input_tokens": 200, "output_tokens": 30},
+        }
+    ],
+}
+run_outlet(f, outlet_body, metadata=meta)
+key = "oi-rate-limiter:glm-5.3:u1:inflight"
+credit_key = "oi-rate-limiter:glm-5.3:u1:credits"
+check("outlet records exact api usage", f._get_redis().zcard(credit_key) == 1)
+check("outlet releases api slot", f._get_redis().zcard(key) == 0)
+check(
+    "outlet sets turn marker",
+    f._get_redis().exists(
+        f"oi-rate-limiter:glm-5.3:u1:done:api-turn:{meta['oi_rate_limiter_turn_id']}"
+    ),
+)
+run_outlet(f, outlet_body, metadata=meta)
+check("repeated outlet does not double-charge", f._get_redis().zcard(credit_key) == 1)
+
+# e) an identity-less outlet call must not FIFO-pop a live request's slot
+f = make_filter(max_concurrent_requests=5, sliding_window_credits=100000)
+run_inlet(f, {"messages": []}, metadata={"chat_id": "cA", "message_id": "mA"})
+run_outlet(
+    f,
+    {
+        "model": "glm-5.3",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "x",
+                "usage": {"input_tokens": 50, "output_tokens": 5},
+            }
+        ],
+    },
+    metadata={},
+)
+check(
+    "identity-less outlet leaves live slots alone",
+    f._get_redis().zcard("oi-rate-limiter:glm-5.3:u1:inflight") == 1,
+)
+
+# f) non-streaming estimate is replaced by exact usage when the outlet fires
+f = make_filter(sliding_window_credits=100000, chars_per_token=3.0)
+meta = {}
+body = {"messages": [{"role": "user", "content": "a" * 300}]}
+run_inlet(f, body, metadata=meta)  # no session/chat -> API client, estimate charged
+credit_key = "oi-rate-limiter:glm-5.3:u1:credits"
+members = f._get_redis().zrange(credit_key, 0, -1)
+check(
+    "estimate charged at inlet",
+    len(members) == 1 and members[0].rsplit(":", 1)[1] == "100",
+    members,
+)
+run_outlet(
+    f,
+    {
+        "model": "glm-5.3",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "x",
+                "usage": {"input_tokens": 200, "output_tokens": 30},
+            }
+        ],
+    },
+    metadata=meta,
+)
+members = f._get_redis().zrange(credit_key, 0, -1)
+check(
+    "outlet replaces estimate with exact usage",
+    len(members) == 1 and members[0].rsplit(":", 1)[1] == "230",
+    members,
+)
+check("est marker removed", not [k for k in f._get_redis().keys() if ":est:" in k])
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

@@ -67,14 +67,21 @@ middleware awaits them.
 ## Redis layout (namespace = rate_limiter_id, else model id)
 
 - `oi-rate-limiter:{ns}:{user}:inflight` — concurrency slots; members
-  `{chat_id}:{message_id}` (web UI, exact release) or `{ts}:{uuid}` (bare
-  API, FIFO release); score = last activity; TTL = silence window
+  `{chat_id}:{message_id}` (web UI, exact release) or `api:{turn_id}` (bare
+  API; the inlet mints the turn id and stashes it in the request-scoped
+  metadata dict as `oi_rate_limiter_turn_id`, which the stream/outlet hooks
+  read back — exact release. FIFO only when no metadata dict reaches the
+  hooks); score = last activity; TTL = silence window
 - `oi-rate-limiter:{ns}:{user}:credits` — `{ts}:{uuid}:{uncached}:{cached}:{out}:{charged}`,
   charged is fractional (6 decimals); whole amounts serialize as integers
   so legacy records coexist
 - `oi-rate-limiter:{ns}:{user}:holds` — `{ts}:{uuid}:{amount}`, fractional
 - `oi-rate-limiter:{ns}:{user}:done:{chat}:{message}` — 15-min markers
-  deduplicating stream/outlet double-recording
+  deduplicating stream/outlet double-recording; bare API turns use
+  `done:api-turn:{turn_id}`
+- `oi-rate-limiter:{ns}:{user}:est:{turn_id}` — points at the credit record
+  holding a bare API turn's inlet-time non-streaming estimate, so an outlet
+  invocation replaces it with exact usage instead of double-charging
 
 ## Hook wiring (verified against v0.9.6 middleware source AND live probes)
 
@@ -86,9 +93,15 @@ middleware awaits them.
 - `outlet`: marker-gated release + exact usage fallback. **v0.9.6 runs the
   outlet ONLY for web UI (event-emitter) flows — bare API calls
   (`/api/chat/completions` and `/api/v1/messages` alike) have NO outlet
-  path at all** (ENABLE_API_OUTLET_FILTERS first appears in v0.11.x). API
-  slots/holds are therefore released only by the stream hook's
-  usage-bearing final chunk, else the TTLs.
+  path at all** (ENABLE_API_OUTLET_FILTERS first appears in v0.11.x, default
+  ON in v0.12.3). On v0.12+ with the flag on, the outlet also fires for API
+  turns: the filter identifies them by the inlet-stashed turn id (done
+  marker `done:api-turn:{turn_id}`, estimate replacement via `est:{turn_id}`),
+  and outlet calls with NO reconstructible identity skip the release rather
+  than FIFO-pop (a blind pop could free another live request's slot). The
+  filter is one version for all regimes — feature detection, no version
+  sniffing. API slots/holds are otherwise released only by the stream
+  hook's usage-bearing final chunk, else the TTLs.
 - Inlet exceptions on API paths always surface as **HTTP 400**
   `{"detail": ...}` — `process_chat` wraps every filter exception as 400,
   never 429 — so Claude Code/OpenCode treat limiter rejections as

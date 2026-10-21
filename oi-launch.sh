@@ -8,13 +8,9 @@ WEBSOCKET_MANAGER="redis"
 WEBSOCKET_REDIS_URL="redis://redis-valkey:6379/1"
 CORS_ALLOW_ORIGIN="https://scrp-chat.econ.cuhk.edu.hk;https://scrp-chat-2.econ.cuhk.edu.hk"
 
-# Get IP of Redis
-#redis_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redis-valkey)
-#echo $redis_ip
-
 # Launch WebUI
 docker run -d \
-  --name open-webui-v0.8.10 \
+  --name open-webui-v0.12.3 \
   --log-driver json-file \
   --log-opt max-size=10m \
   --log-opt max-file=5 \
@@ -32,9 +28,10 @@ docker run -d \
   -e DATABASE_URL=postgresql://openwebui_user:scrp-postgresql-pwd@scrp-control-2:5432/openwebui_test \
   -e DATABASE_POOL_SIZE=15 \
   -e DATABASE_POOL_MAX_OVERFLOW=20 \
-  -e UVICORN_WORKERS=4 \
   -e VECTOR_DB=chroma \
   -e CHROMA_HTTP_HOST="chroma-server" \
   -e CHROMA_HTTP_PORT=8000 \
-  ghcr.io/open-webui/open-webui:v0.8.10
-
+  -e UVICORN_WORKERS=4 \
+  -e TZ=Asia/Hong_Kong \
+  -e ENABLE_API_OUTLET_FILTERS="false" \
+  ghcr.io/open-webui/open-webui:v0.12.3

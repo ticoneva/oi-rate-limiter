@@ -98,14 +98,18 @@ rather than locking anyone out. A leaked slot can never strand a user,
 because it self-expires in minutes.
 
 Slots are identified by the turn's `(chat_id, message_id)` when the web UI
-supplies them, giving exact release; bare API calls without that identity
-use unique members and are released FIFO. Two smaller caveats: admission
+supplies them, giving exact release; bare API calls get a per-request **turn
+id** the inlet mints and stashes into the request-scoped metadata dict
+(`oi_rate_limiter_turn_id`), which Open WebUI threads to the stream and
+outlet hooks — so API turns are also exactly releasable (FIFO remains only
+when no metadata dict reaches the hooks). Two smaller caveats: admission
 check-then-add is not atomic, so a burst of near-simultaneous inlets can
 exceed the cap by one or two (the same accepted race the credit holds have);
-and API-path release relies on Open WebUI's `ENABLE_API_OUTLET_FILTERS`
-(v0.11+ only, default on; v0.9.x has no API outlet at all) — without it,
-API slots are recovered solely by the stream hook's usage-bearing final
-chunk or the silence TTL.
+and API-path outlet accounting relies on Open WebUI's
+`ENABLE_API_OUTLET_FILTERS` (v0.11+ only, default on; v0.9.x has no API
+outlet at all) — without it, API slots are recovered solely by the stream
+hook's usage-bearing final chunk or the silence TTL, and non-streaming API
+turns keep their inlet-time estimate charge.
 The admin tool's `clear_credit_usage` also deletes in-flight slots, the
 manual escape hatch if a user ever reports being stuck.
 
@@ -114,7 +118,7 @@ manual escape hatch if a user ever reports being stuck.
 | Call type | Enforcement | Token accounting |
 |---|---|---|
 | Streaming API (`/api/chat/completions`, `/api/v1/messages`) | `inlet` check | `stream` hook records actual usage from the final SSE chunk |
-| Non-streaming API | `inlet` check | `inlet` records an estimated input-token charge (no hook sees the response) |
+| Non-streaming API | `inlet` check | `inlet` records an estimated input-token charge; when the outlet hook fires (v0.12+ with `ENABLE_API_OUTLET_FILTERS`) it is replaced by exact usage |
 | Web UI streaming | `inlet` check | `stream` hook records actuals |
 | Web UI non-streaming | `inlet` check | `outlet` hook records actuals, deduplicated against the stream hook via a short-lived marker |
 | Internal task calls (title/tag generation) | not counted — they bypass chat filters in Open WebUI 0.8.x | |
@@ -231,8 +235,9 @@ multipliers) — one credit unit equals one z.ai credit. For the Pro plan
 ## Redis layout
 
 - `oi-rate-limiter:{namespace}:{user_id}:inflight` — in-flight request slots;
-  sorted-set members are `{chat_id}:{message_id}` (web UI turns, exact
-  release) or `{timestamp}:{uuid}` (bare API calls, FIFO release), scored by
+  sorted-set members are `{chat_id}:{message_id}` (web UI turns) or
+  `api:{turn_id}` (bare API calls; the inlet mints the turn id and stashes
+  it in the request metadata), scored by
   last activity and TTL-bounded by the silence window
 - `oi-rate-limiter:{namespace}:{user_id}:credits` — credit records; sorted-set
   members are `{timestamp}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}`
@@ -240,7 +245,11 @@ multipliers) — one credit unit equals one z.ai credit. For the Pro plan
 - `oi-rate-limiter:{namespace}:{user_id}:holds` — admission holds; members are
   `{timestamp}:{uuid}:{amount}`, TTL-bounded
 - `oi-rate-limiter:{namespace}:{user_id}:done:{chat_id}:{message_id}` —
-  15-minute markers preventing stream/outlet double-counting
+  15-minute markers preventing stream/outlet double-counting; bare API turns
+  use `done:api-turn:{turn_id}`
+- `oi-rate-limiter:{namespace}:{user_id}:est:{turn_id}` — short-lived pointer
+  from a bare API turn to the credit record holding its inlet-time estimate,
+  so the outlet can replace the estimate with exact usage
 
 The namespace is `rate_limiter_id` when set, else the model ID. Credit weights
 are baked into records at write time (per instance), so retuning a weight
