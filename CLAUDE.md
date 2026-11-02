@@ -26,19 +26,29 @@ instead.
 ## The live deployment (important)
 
 - Runs at https://scrp-chat.econ.cuhk.edu.hk / scrp-chat-2, backed by
-  Postgres and Redis (Valkey).
-- **The running Open WebUI is v0.9.6** (verified 2026-10-20 via
-  `GET /api/version` -> `{"version":"0.9.6"}`; the deployed behavior also
-  matches v0.9.6 source, see hook wiring below). `oi-launch.sh`'s image tag
-  (v0.8.10) is stale — never trust the launch script. The DB's
-  `alembic_version` (461111b60977) does NOT distinguish 0.9.6 from 0.11.x —
-  that migration is a head in both; `/api/version` is the direct check.
-  Diffing deployed `function`/`tool` content against local files confirms
-  what filter/tool code is actually running.
+  Postgres and Redis (Valkey). scrp-chat resolves to the login node itself,
+  which nginx-proxies to the container on `scrp-control-2:8086`
+  (`/etc/nginx/sites-available/chat`).
+- **The running Open WebUI is v0.12.3** (verified 2026-11-02 via
+  `GET /api/version` on both hostnames). Never trust `oi-launch.sh` for the
+  version — its container name currently matches (open-webui-v0.12.3) but
+  it still mounts the old `open-webui-v0.8.10-data/` volume and has been
+  stale before. `/api/version` is the direct check. Current
+  `alembic_version`: 0bd252b206fb. Diffing deployed `function`/`tool`
+  content against local files confirms what filter/tool code is actually
+  running.
+- **The launch script sets `ENABLE_API_OUTLET_FILTERS="false"`** — although
+  v0.12.3 supports outlet filters on API paths, they are OFF here: bare API
+  calls have no outlet path on this deployment (see hook wiring below).
 - Postgres (reachable from login nodes): `scrp-control-2:5432`, db
   `openwebui_test`, user `openwebui_user`, password in `oi-launch.sh`. The
   `function` and `tool` tables hold the deployed source of filters/tools —
   diff against local files to confirm what's actually running.
+- **Redis is NOT reachable from login nodes**: the Valkey container runs on
+  scrp-control-2's internal Docker network (`redis-valkey:6379`, no
+  published port) and scrp-control-2 accepts no SSH from login nodes. Live
+  ledger inspection requires running code through the deployment itself
+  (e.g. the admin tool in chat); diagnose from code + valves otherwise.
 - Deployment = paste the .py into the function/tool in the Open WebUI UI
   (Workspace → Functions/Tools). Editing reloads the module. There is no
   file-based deploy.
@@ -88,25 +98,25 @@ middleware awaits them.
   (OpenAI-Codex-style first-use anchoring). Session/minute windows are
   always sliding. Admin tool's clear deletes anchors.
 
-## Hook wiring (verified against v0.9.6 middleware source AND live probes)
+## Hook wiring (verified against v0.12.3 middleware source AND live probes)
 
 - `inlet`: concurrency check → credit check → admit slot (+ hold for
   streaming, estimate for non-streaming API calls)
 - `stream`: per-chunk liveness refresh of the in-flight slot (runs even
   with credits disabled); usage-bearing final chunk records exact charge,
   releases the slot, sets done marker
-- `outlet`: marker-gated release + exact usage fallback. **v0.9.6 runs the
-  outlet ONLY for web UI (event-emitter) flows — bare API calls
-  (`/api/chat/completions` and `/api/v1/messages` alike) have NO outlet
-  path at all** (ENABLE_API_OUTLET_FILTERS first appears in v0.11.x, default
-  ON in v0.12.3). On v0.12+ with the flag on, the outlet also fires for API
-  turns: the filter identifies them by the inlet-stashed turn id (done
-  marker `done:api-turn:{turn_id}`, estimate replacement via `est:{turn_id}`),
-  and outlet calls with NO reconstructible identity skip the release rather
-  than FIFO-pop (a blind pop could free another live request's slot). The
-  filter is one version for all regimes — feature detection, no version
-  sniffing. API slots/holds are otherwise released only by the stream
-  hook's usage-bearing final chunk, else the TTLs.
+- `outlet`: marker-gated release + exact usage fallback. On v0.12.3 the
+  outlet CAN run for bare API calls (`/api/chat/completions`,
+  `/api/v1/messages`), gated by ENABLE_API_OUTLET_FILTERS — but **this
+  deployment sets the flag to "false"**, so API calls have no outlet path:
+  their slots/holds are released only by the stream hook's usage-bearing
+  final chunk, else the TTLs. On a deployment with the flag on, the outlet
+  also fires for API turns: the filter identifies them by the
+  inlet-stashed turn id (done marker `done:api-turn:{turn_id}`, estimate
+  replacement via `est:{turn_id}`), and outlet calls with NO
+  reconstructible identity skip the release rather than FIFO-pop (a blind
+  pop could free another live request's slot). The filter is one version
+  for all regimes — feature detection, no version sniffing.
 - Inlet exceptions on API paths always surface as **HTTP 400**
   `{"detail": ...}` — `process_chat` wraps every filter exception as 400,
   never 429 — so Claude Code/OpenCode treat limiter rejections as
@@ -115,22 +125,25 @@ middleware awaits them.
   release hook: its slot leaks for the full silence TTL and its hold for
   hold_ttl. Client disconnect mid-stream likewise fires NO hook. The
   failure direction is deliberately over-admission, never lockout.
-- `/api/v1/messages` (Anthropic Messages API, used by Claude Code) exists
-  in v0.9.6: main.py converts the payload to OpenAI format, routes through
+- `/api/v1/messages` (Anthropic Messages API, used by Claude Code) in
+  v0.12.3: main.py converts the payload to OpenAI format, routes through
   the same `chat_completion` pipeline (all filters apply), then converts
   the OpenAI SSE stream back to Anthropic events — filter stream hooks see
-  the OpenAI-format chunks, before conversion.
-- Known v0.9.6 conversion traps hitting Claude Code specifically (verified
-  live 2026-10-20): `convert_anthropic_to_openai_payload` passes an empty
-  `tools: []` through to vLLM, which 400s — every such helper request
-  (Claude Code sends them for topic/command detection) leaks a slot for
-  `in_flight_ttl_minutes` and a hold for `hold_ttl_minutes` (the filter
-  strips `tools: []` at inlet since v1.1.4, neutralizing the leak); and the
-  stream converter drops `reasoning_content` and reports `input_tokens: 0`
-  in `message_start`. The `tools: []` passthrough is still present in the
-  v0.11.0 source — upgrading does not fix it.
+  the OpenAI-format chunks, before conversion. Direct-to-Anthropic
+  backends instead take a `passthrough_anthropic_messages` path that
+  bypasses this conversion (not our setup: backends are vLLM).
+- Conversion traps hitting Claude Code: the v0.9.6-era
+  `convert_anthropic_to_openai_payload` passed an empty `tools: []` through
+  to vLLM, which 400s — leaking a slot and hold per helper request (the
+  filter strips `tools: []` at inlet since v1.1.4, neutralizing the leak).
+  **Fixed upstream in v0.12.3** (the converter guards
+  `if anthropic_payload.get('tools'):`), but the inlet strip stays as
+  defense for older/bespoke deployments. The stream converter still drops
+  `reasoning_content` and reports `input_tokens: 0` in `message_start`.
 - Verify Open WebUI behavior by fetching the specific tag's source, e.g.
-  `https://raw.githubusercontent.com/open-webui/open-webui/v0.9.6/backend/open_webui/utils/middleware.py`
+  `https://raw.githubusercontent.com/open-webui/open-webui/v0.12.3/backend/open_webui/utils/middleware.py`
+  (v0.12.3 also split the Anthropic conversion into
+  `backend/open_webui/utils/anthropic.py`)
 
 ## Conventions
 
