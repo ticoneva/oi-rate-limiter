@@ -37,9 +37,12 @@ instead.
   `alembic_version`: 0bd252b206fb. Diffing deployed `function`/`tool`
   content against local files confirms what filter/tool code is actually
   running.
-- **The launch script sets `ENABLE_API_OUTLET_FILTERS="false"`** — although
-  v0.12.3 supports outlet filters on API paths, they are OFF here: bare API
-  calls have no outlet path on this deployment (see hook wiring below).
+- **`ENABLE_API_OUTLET_FILTERS` is not set in the real launch script** —
+  v0.12.3's default is True, so **API-path outlet filters are ON** on this
+  deployment. (The repo's `oi-launch.sh` says "false"; it is stale — the
+  launch script is unreliable for flags, not just versions. Confirmed by the
+  owner 2026-11-02; the running container cannot be inspected directly — no
+  docker/SSH access from login nodes.)
 - Postgres (reachable from login nodes): `scrp-control-2:5432`, db
   `openwebui_test`, user `openwebui_user`, password in `oi-launch.sh`. The
   `function` and `tool` tables hold the deployed source of filters/tools —
@@ -105,18 +108,19 @@ middleware awaits them.
 - `stream`: per-chunk liveness refresh of the in-flight slot (runs even
   with credits disabled); usage-bearing final chunk records exact charge,
   releases the slot, sets done marker
-- `outlet`: marker-gated release + exact usage fallback. On v0.12.3 the
-  outlet CAN run for bare API calls (`/api/chat/completions`,
-  `/api/v1/messages`), gated by ENABLE_API_OUTLET_FILTERS — but **this
-  deployment sets the flag to "false"**, so API calls have no outlet path:
-  their slots/holds are released only by the stream hook's usage-bearing
-  final chunk, else the TTLs. On a deployment with the flag on, the outlet
-  also fires for API turns: the filter identifies them by the
-  inlet-stashed turn id (done marker `done:api-turn:{turn_id}`, estimate
-  replacement via `est:{turn_id}`), and outlet calls with NO
-  reconstructible identity skip the release rather than FIFO-pop (a blind
-  pop could free another live request's slot). The filter is one version
-  for all regimes — feature detection, no version sniffing.
+- `outlet`: marker-gated release + exact usage fallback. On v0.12.3 with
+  ENABLE_API_OUTLET_FILTERS on (this deployment — flag unset, default
+  True), the outlet also fires for bare API calls
+  (`/api/chat/completions`, `/api/v1/messages`): the filter identifies
+  them by the inlet-stashed turn id (done marker `done:api-turn:{turn_id}`,
+  estimate replacement via `est:{turn_id}`), so non-streaming API turns get
+  exact usage instead of their inlet-time estimate and slots are released
+  exactly. Outlet calls with NO reconstructible identity skip the release
+  rather than FIFO-pop (a blind pop could free another live request's
+  slot). On deployments with the flag off, API slots/holds are released
+  only by the stream hook's usage-bearing final chunk, else the TTLs, and
+  non-streaming API turns keep their estimate charge. The filter is one
+  version for all regimes — feature detection, no version sniffing.
 - Inlet exceptions on API paths always surface as **HTTP 400**
   `{"detail": ...}` — `process_chat` wraps every filter exception as 400,
   never 429 — so Claude Code/OpenCode treat limiter rejections as
