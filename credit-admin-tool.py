@@ -2,7 +2,7 @@
 title: Credit Usage Admin Tool
 author: Vinci Chow
 author_url: https://github.com/ticoneva
-version: 0.6.0
+version: 0.7.0
 license: MIT
 
 Admin-only companion to the Rate and Credit Limit Filter. Queries a user's
@@ -197,6 +197,46 @@ class Tools:
         return f"{amount:.2f}"
 
     @staticmethod
+    def _recovery_seconds(records, limit: float, win_secs: float, now: float):
+        """Seconds until the window's committed credits drop below `limit`,
+        given (ts, charged) pairs already restricted to the window. Mirrors
+        the filter's wait computation: the limit lifts when the *cumulative*
+        charge of records aging out exceeds the overage — not when the oldest
+        single record expires. Returns None when already under budget or when
+        no projection can be made."""
+        committed = sum(c for _, c in records)
+        overage = committed - limit
+        # overage == 0 (exactly at limit) still blocks the user — the filter
+        # limits at used >= limit — so project the first record's expiry;
+        # only a strict surplus means there is nothing to recover from.
+        if overage < 0 or not records:
+            return None
+        ordered = sorted(records)
+        cum = 0.0
+        for ts, charge in ordered:
+            cum += charge
+            if cum > overage:
+                return max(1, ts + win_secs - now)
+        return max(1, ordered[-1][0] + win_secs - now)
+
+    @staticmethod
+    def _fmt_duration(secs: float) -> str:
+        """Human wait duration: days / hours / minutes, one decimal."""
+        if secs >= 86400:
+            return f"{secs / 86400:.1f} days"
+        if secs >= 3600:
+            return f"{secs / 3600:.1f} hours"
+        return f"{max(1, secs / 60):.0f} min"
+
+    @staticmethod
+    def _fmt_recovery_time(secs: float) -> str:
+        """Absolute local recovery time with weekday (e.g. 'Wed 09:42 PM'),
+        so multi-day waits are unambiguous."""
+        from datetime import datetime, timedelta
+
+        return (datetime.now() + timedelta(seconds=secs)).strftime("%a %I:%M %p")
+
+    @staticmethod
     def _caller_is_admin(__user__: Optional[dict]) -> bool:
         """Open WebUI passes __user__ as a flat model_dump() dict with
         id/name/email/role at the top level (verified v0.8.10 and v0.11.0)."""
@@ -377,6 +417,22 @@ class Tools:
                     summary += (
                         f" of {self._fmt(limit)} budget ({pct:.1f}%)"
                     )
+                    # Over budget: project when aged-out credits bring usage
+                    # back under (records only — the tool does not read the
+                    # filter's holds, so a hold-driven overage shows a
+                    # projection based on committed records, which ages out
+                    # no later).
+                    if charged >= limit:
+                        win_records = [(p[0], p[4]) for p in subset]
+                        recover = self._recovery_seconds(
+                            win_records, limit, win_secs, now
+                        )
+                        if recover is not None:
+                            summary += (
+                                f" — over budget, recovers in "
+                                f"{self._fmt_duration(recover)} "
+                                f"({self._fmt_recovery_time(recover)})"
+                            )
                 summary += f" over {len(reqs)} requests"
                 lines.append(summary)
 

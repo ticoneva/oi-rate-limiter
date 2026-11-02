@@ -393,6 +393,50 @@ for style, FakeUsers in (("sync (v0.8)", FakeUsersSync), ("async (v0.9+)", FakeU
 
 _mod.Users = None  # restore for any later sections
 
+print("== 10. Recovery projection on over-budget windows ==")
+t = make_tool()
+t.valves.sliding_window_credits = 50000
+t.valves.credits_per_session = None  # isolate the week window
+now = time.time()
+# 50 small records (3.0) spread over the past ~1 day plus one big recent
+# one: 50018.7 total, 18.7 over. Recovery needs 7 small records to age out;
+# the 7th-oldest is ~0.12 days old, so recovery is ~6.9 days out.
+for i in range(50):
+    add_record(t, "scrp-chat", "u1", 0, 0, 0, 3.0, age_secs=i * (86400 / 51))
+add_record(t, "scrp-chat", "u1", 0, 0, 0, 49868.7, age_secs=60)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check("over-budget week shows recovery line", "over budget, recovers in" in out, out)
+check(
+    "recovery duration is multi-day",
+    "days" in out,
+    out,
+)
+check("recovery includes weekday time", "recovers in" in out and ("AM" in out or "PM" in out), out)
+check(
+    "session window under budget shows no recovery line",
+    "session" not in out or "recovers in" not in out.split("week")[0],
+    out,
+)
+
+# Under budget: no recovery line anywhere.
+t = make_tool()
+add_record(t, "scrp-chat", "u1", 0, 0, 0, 42.0, age_secs=60)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check("under budget shows no recovery line", "recovers in" not in out, out)
+check("all-time window never shows recovery", "all time" in out and "recovers in" not in out, out)
+
+# Exactly at limit -> overage 0 -> first record expiry.
+t = make_tool()
+t.valves.credits_per_session = 500
+add_record(t, "scrp-chat", "u1", 0, 0, 0, 500.0, age_secs=4 * 3600)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check("exact-at-limit shows recovery line", "over budget, recovers in" in out, out)
+
+print("== 11. Duration formatting ==")
+check("hours format", Tools._fmt_duration(2.5 * 3600) == "2.5 hours", Tools._fmt_duration(2.5 * 3600))
+check("minutes format", Tools._fmt_duration(12 * 60) == "12 min", Tools._fmt_duration(12 * 60))
+check("days format", Tools._fmt_duration(2.6 * 86400) == "2.6 days", Tools._fmt_duration(2.6 * 86400))
+
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

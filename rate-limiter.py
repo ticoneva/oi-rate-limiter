@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: Vinci Chow
 author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
-version: 1.2.0
+version: 1.3.0
 license: MIT
 """
 
@@ -432,13 +432,22 @@ class Filter:
         )
 
     def _credit_windows(self) -> list:
-        """Active (limit, window_seconds) pairs, ascending window length."""
+        """Active (label, limit, window_seconds) triples, ascending window
+        length. The label names the window in user-facing messages."""
         return [
-            (limit, secs)
-            for limit, secs in (
-                (self.valves.credits_per_minute, 60),
-                (self.valves.credits_per_session, self.valves.session_window_minutes * 60),
-                (self.valves.sliding_window_credits, self.valves.credit_window_minutes * 60),
+            (label, limit, secs)
+            for label, limit, secs in (
+                ("per-minute", self.valves.credits_per_minute, 60),
+                (
+                    "5-hour session",
+                    self.valves.credits_per_session,
+                    self.valves.session_window_minutes * 60,
+                ),
+                (
+                    "weekly",
+                    self.valves.sliding_window_credits,
+                    self.valves.credit_window_minutes * 60,
+                ),
             )
             if limit is not None
         ]
@@ -488,12 +497,107 @@ class Filter:
                 continue
         return used, earliest
 
+    def _recovery_wait(
+        self,
+        user_id: str,
+        model_id: str,
+        now: float,
+        win_secs: float,
+        limit: float,
+    ) -> int:
+        """Seconds until this window's usage (records + holds) drops below
+        `limit`, or 1 if that cannot be pinned down.
+
+        Committed credits over the limit age out one record at a time, so the
+        limit lifts only when the *cumulative* charge of expired records
+        exceeds the overage — not when the oldest single record expires (a
+        user 20 credits over stays blocked until 20+ credits' worth of records
+        have aged out, which can be days later than the oldest record's
+        expiry).
+
+        Holds carry no per-member expiry (their key has one TTL), so the
+        projection treats all holds as live until the latest hold's placement
+        plus hold_ttl_minutes, then gone. Recovery is the earlier of:
+        (a) after holds are gone, records having aged out enough that
+            committed alone is under the limit; or
+        (b) before holds are gone, records having aged out enough to cover
+            the full overage including holds (conservative: assumes every
+            hold lives to its TTL). The result never quotes a time earlier
+            than the true recovery."""
+        namespace = self._get_namespace(model_id)
+        credit_key = self._credit_key(namespace, user_id)
+        holds_key = self._holds_key(namespace, user_id)
+        r = self._get_redis()
+
+        records = []
+        for member in r.zrangebyscore(credit_key, now - win_secs, "+inf"):
+            try:
+                records.append(
+                    (float(member.split(":")[0]), float(member.rsplit(":", 1)[1]))
+                )
+            except (ValueError, IndexError):
+                continue
+        records.sort()
+
+        committed = sum(c for _, c in records)
+        hold_total = 0.0
+        latest_hold_ts = None
+        for member in r.zrangebyscore(holds_key, now - win_secs, "+inf"):
+            try:
+                hold_total += float(member.rsplit(":", 1)[1])
+                latest_hold_ts = max(latest_hold_ts or 0.0, float(member.split(":")[0]))
+            except (ValueError, IndexError):
+                continue
+
+        hold_secs = self.valves.hold_ttl_minutes * 60
+        # Time when the last live hold is assumed gone (None: no holds).
+        hold_gone_at = (
+            latest_hold_ts + hold_secs - now if latest_hold_ts is not None else None
+        )
+
+        def walk(overage: float):
+            """Expiry wait of the first record whose cumulative aged-out
+            charge exceeds `overage`, or None if no record set covers it."""
+            cum = 0.0
+            for ts, charge in records:
+                cum += charge
+                if cum > overage:
+                    return ts + win_secs - now
+            return None
+
+        # (a) Holds gone: need committed alone under the limit.
+        overage_committed = committed - limit
+        if overage_committed < 0:
+            after_holds = hold_gone_at if hold_gone_at is not None else 1
+        else:
+            t = walk(overage_committed)
+            if t is None:
+                after_holds = None
+            elif hold_gone_at is None:
+                after_holds = t
+            else:
+                # Records must age out AND holds be gone (whichever is later).
+                after_holds = max(t, hold_gone_at)
+
+        # (b) Holds live: records must cover the full overage.
+        overage_full = committed + hold_total - limit
+        before_holds = None
+        if hold_gone_at is not None and overage_full >= 0:
+            t = walk(overage_full)
+            if t is not None and t < hold_gone_at:
+                before_holds = t
+
+        candidates = [c for c in (after_holds, before_holds) if c is not None]
+        return max(1, int(min(candidates))) if candidates else 1
+
     def credit_limited(
         self, user_id: str, model_id: str
-    ) -> Tuple[bool, Optional[int], int, Optional[int]]:
-        """Returns (limited, wait_seconds, used, limit) where (used, limit)
-        describe the window closest to its limit, even when not limited.
-        Pending holds count toward usage."""
+    ) -> Tuple[bool, Optional[int], int, Optional[int], Optional[str]]:
+        """Returns (limited, wait_seconds, used, limit, window_label) where
+        (used, limit, label) describe the window closest to its limit, even
+        when not limited, and wait_seconds is the projected time until that
+        window's usage drops back under its limit. Pending holds count toward
+        usage."""
         namespace = self._get_namespace(model_id)
         key = self._credit_key(namespace, user_id)
         now = time.time()
@@ -501,24 +605,24 @@ class Filter:
 
         self._prune_key(key, now, window_secs)
 
-        best_used, best_limit = 0, None
+        best_used, best_limit, best_label = 0, None, None
         best_ratio = -1.0
-        for limit, win_secs in self._credit_windows():
+        for label, limit, win_secs in self._credit_windows():
             used, earliest = self._used_with_holds(user_id, model_id, now, win_secs)
             if used >= limit:
-                wait = int(win_secs - (now - (earliest if earliest else now)))
-                return True, wait, used, limit
+                wait = self._recovery_wait(user_id, model_id, now, win_secs, limit)
+                return True, wait, used, limit, label
             ratio = used / limit
             if ratio > best_ratio:
-                best_ratio, best_used, best_limit = ratio, used, limit
+                best_ratio, best_used, best_limit, best_label = ratio, used, limit, label
 
-        return False, None, best_used, best_limit
+        return False, None, best_used, best_limit, best_label
 
     def _remaining_credits(self, user_id: str, model_id: str) -> Optional[int]:
         now = time.time()
 
         remaining = None
-        for limit, win_secs in self._credit_windows():
+        for _label, limit, win_secs in self._credit_windows():
             used, _ = self._used_with_holds(user_id, model_id, now, win_secs)
             room = limit - used
             if remaining is None or room < remaining:
@@ -672,6 +776,10 @@ class Filter:
     @staticmethod
     def _retry_time(wait_seconds: int) -> str:
         future_time = datetime.now() + timedelta(seconds=wait_seconds)
+        # Include the weekday once the wait crosses a day — "12:10 AM" is
+        # actively misleading when the real wait is 2+ days.
+        if wait_seconds >= 86400:
+            return future_time.strftime("%a %I:%M %p")
         return future_time.strftime("%I:%M %p")
 
     def _enforced_for(self, __user__: Optional[dict]) -> bool:
@@ -931,12 +1039,16 @@ class Filter:
                 )
 
             if self._credit_limits_configured():
-                credit_limited, credit_wait, used_credits, credit_limit = (
-                    self.credit_limited(user_id, model_id)
-                )
+                (
+                    credit_limited,
+                    credit_wait,
+                    used_credits,
+                    credit_limit,
+                    credit_window_label,
+                ) = self.credit_limited(user_id, model_id)
                 if credit_limited:
                     raise Exception(
-                        f"Credit limit exceeded. You have used {used_credits:.1f} of {credit_limit} credits on model '{model_id}'. Please try again at {self._retry_time(credit_wait)}."
+                        f"Credit limit exceeded. You have used {used_credits:.1f} of {credit_limit} credits ({credit_window_label} window) on model '{model_id}'. Please try again at {self._retry_time(credit_wait)}."
                     )
 
             self._admit_inflight(user_id, model_id, metadata)

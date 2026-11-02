@@ -64,6 +64,16 @@ This mirrors how prefill and decode are priced differently in practice, and
 lets cache hits be discounted. Set all weights to `1.0` (the default) and the
 budget is a plain total-token limit.
 
+When a budget is exceeded, the rejection message names the tripped window and
+quotes the time the limit will lift. That time is a *cumulative aging*
+projection: the limit recovers only when the total charge of records that
+have aged out of the window exceeds the overage — not when the oldest single
+record expires (a user 20 credits over stays blocked until 20+ credits' worth
+of records age out, which can be days after the oldest record's expiry).
+Waits under a day are quoted as a time ("12:10 AM"); waits of a day or more
+include the weekday ("Wed 09:42 PM") so multi-day recoveries are not mistaken
+for same-day ones.
+
 Charges are stored **fractionally** (full precision, 6 decimals) — a short
 prompt that costs 0.141 credits records 0.141, so many small requests
 accumulate exactly instead of each rounding away to zero. Rounding happens
@@ -284,7 +294,12 @@ same instance.
   `used of budget (percent)` against the tool's `credits_per_session` and
   `sliding_window_credits` valves — keep them equal to the filter's valves
   of the same names (the window-length valves too) for exact percentages,
-  or set a limit to None to report that window without a budget. `user`
+  or set a limit to None to report that window without a budget. A window at
+  or over its budget additionally projects its recovery time, e.g.
+  `week: 50018.7 of 50000 budget (100.0%) — over budget, recovers in 2.6 days (Wed 09:42 PM)`,
+  using the same cumulative-aging math as the filter's rejection message
+  (records only — pending holds are not read, so a hold-driven overage may
+  recover sooner than projected). `user`
   accepts a user ID, email, or name. Names are
   resolved case-insensitively; an exact name match wins over substring
   siblings, and a name matching multiple users returns an error listing the

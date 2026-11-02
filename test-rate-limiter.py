@@ -391,7 +391,7 @@ check("both models write to shared key", len(members) == 2, members)
 check("per-instance weights baked into charge", charges == ["200", "400"], charges)
 
 # B's check against the shared budget sees 600 total
-limited, wait, used, limit = fb.credit_limited("u1", "model-b")
+limited, wait, used, limit, _label = fb.credit_limited("u1", "model-b")
 check("shared sum correct across instances", used == 600 and not limited, used)
 
 print("== 13. Multi-worker consistency (shared redis state) ==")
@@ -683,10 +683,10 @@ run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 300
 holds_key = "oi-rate-limiter:glm-5.3:u1:holds"
 ttl = f._get_redis().ttl(holds_key)
 check("hold key has TTL", 0 < ttl <= 15 * 60, ttl)
-limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+limited, wait, used, lim, _label = f.credit_limited("u1", "glm-5.3")
 check("hold counts toward usage while live", used == 300, used)
 f._get_redis().delete(holds_key)  # simulate expiry
-limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+limited, wait, used, lim, _label = f.credit_limited("u1", "glm-5.3")
 check("expired hold stops counting", used == 0, used)
 
 print("== 22. Output reserve in hold ==")
@@ -706,11 +706,11 @@ f = make_filter(
 )
 run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 300}]})
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=300, completion_tokens=100))  # 400
-limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+limited, wait, used, lim, _label = f.credit_limited("u1", "glm-5.3")
 check("session window counts usage", used == 400 and not limited, (used, lim))
 run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 100}]})
 run_stream(f, vllm_final_chunk_dict(prompt_tokens=100, completion_tokens=0))  # +100
-limited, wait, used, lim = f.credit_limited("u1", "glm-5.3")
+limited, wait, used, lim, _label = f.credit_limited("u1", "glm-5.3")
 check("session limit blocks at 500", limited and used == 500 and lim == 500, (limited, used, lim))
 check("wait is bounded by the 5h window", wait is not None and wait <= 300 * 60, wait)
 
@@ -1329,6 +1329,100 @@ check(
     members,
 )
 check("est marker removed", not [k for k in f._get_redis().keys() if ":est:" in k])
+
+print("== 30. Recovery wait: cumulative aging, not oldest record ==")
+# A user over the weekly budget stays limited until the *cumulative* charge
+# of aged-out records exceeds the overage. The quoted wait must reflect
+# that, not the oldest record's expiry (which frees only a few credits).
+f = make_filter(
+    sliding_window_credits=50000, credits_per_session=None,
+    credit_window_minutes=10080,
+)
+r = f._get_redis()
+key = "oi-rate-limiter:glm-5.3:u1:credits"
+now = time.time()
+# 50 small records (3.0) oldest, plus one big recent one: 50018.7 total,
+# 18.7 over. Clearing 18.7 needs 7 of the 3.0 records (21 > 18.7).
+charges = [3.0] * 50 + [49868.7]
+for i, c in enumerate(charges):
+    ts = now - 6.9 * 86400 + i * (6.9 * 86400 / len(charges))
+    r.zadd(key, {f"{ts}:uuid{i}:0:0:0:{c}": ts})
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("week window trips", limited and used == 50018.7 and lim == 50000, (limited, used, lim))
+check("window labeled weekly", label == "weekly", label)
+ts7 = now - 6.9 * 86400 + 6 * (6.9 * 86400 / 51)
+expected = int(ts7 + 604800 - now)
+check(
+    "wait = expiry of record whose cumulative charge clears the overage",
+    wait is not None and abs(wait - expected) <= 2,
+    (wait, expected),
+)
+# And distinctly later than the oldest record's expiry (the old buggy value).
+oldest_expiry = int((now - 6.9 * 86400) + 604800 - now)
+check("wait is later than oldest-record expiry", wait > oldest_expiry + 3600, (wait, oldest_expiry))
+
+print("== 31. Recovery wait edge cases ==")
+# a) committed exactly at limit -> overage 0, first record expiry
+f = make_filter(sliding_window_credits=100, credit_window_minutes=10080)
+r = f._get_redis()
+key = "oi-rate-limiter:glm-5.3:u1:credits"
+ts_old = now - 5 * 86400
+r.delete(key)
+r.zadd(key, {f"{ts_old}:a:0:0:0:100": ts_old})
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("exact-at-limit is limited", limited and used == 100, (limited, used))
+check(
+    "overage 0 -> oldest record expiry",
+    wait is not None and abs(wait - int(ts_old + 604800 - now)) <= 2,
+    wait,
+)
+
+# b) hold-driven overage: committed under limit, hold pushes over. The wait
+# is bounded by the hold TTL (holds are key-TTL'd, not per-record).
+f = make_filter(
+    sliding_window_credits=100, credit_window_minutes=10080,
+    hold_ttl_minutes=15, chars_per_token=1.0,
+)
+r = f._get_redis()
+r.delete(key)
+ts_recent = now - 60
+r.zadd(key, {f"{ts_recent}:a:0:0:0:90": ts_recent})
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 20}]})  # hold of 20
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("hold pushes over limit", limited and used == 110, (limited, used))
+check(
+    "hold-driven wait bounded by hold TTL",
+    wait is not None and 0 < wait <= 15 * 60,
+    wait,
+)
+
+print("== 32. Retry time format and window label in message ==")
+long_time = Filter._retry_time(2 * 86400)
+weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+check(
+    "retry time includes weekday at >= 1 day",
+    any(d in long_time for d in weekdays),
+    long_time,
+)
+short = Filter._retry_time(3600)
+check("retry time is time-only below a day", not any(d in short for d in weekdays), short)
+
+# Inlet message names the tripped window.
+f = make_filter(
+    sliding_window_credits=100, credit_window_minutes=10080, chars_per_token=1.0,
+)
+r = f._get_redis()
+r.delete("oi-rate-limiter:glm-5.3:u1:credits")
+r.delete("oi-rate-limiter:glm-5.3:u1:holds")
+ts = now - 60
+r.zadd("oi-rate-limiter:glm-5.3:u1:credits", {f"{ts}:a:0:0:0:150": ts})
+try:
+    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]})
+    check("over-budget inlet raises", False, "no exception")
+except Exception as e:
+    msg = str(e)
+    check("message names the weekly window", "weekly window" in msg, msg)
+    check("message includes a retry time", "try again at" in msg, msg)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")
