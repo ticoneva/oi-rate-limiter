@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: Vinci Chow
 author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
-version: 1.3.0
+version: 1.4.0
 license: MIT
 """
 
@@ -78,6 +78,36 @@ class Filter:
         credit_window_minutes: int = Field(
             default=10080,
             description="Duration of the credit sliding window in minutes.",
+        )
+        window_mode: str = Field(
+            default="fixed-anchor",
+            # Select valve: {value,label} options, no description (Open WebUI
+            # renders a select description as a duplicated placeholder item —
+            # see the status_unit comment above).
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": [
+                        {
+                            "value": "fixed-anchor",
+                            "label": (
+                                "fixed-anchor — weekly budget resets fully every "
+                                "7 days, period anchored to the user's first "
+                                "request (z.ai / OpenAI Codex subscription "
+                                "semantics)"
+                            ),
+                        },
+                        {
+                            "value": "sliding",
+                            "label": (
+                                "sliding — weekly budget counts credits spent in "
+                                "the trailing 7 days; recovers gradually as "
+                                "charges age out"
+                            ),
+                        },
+                    ],
+                }
+            },
         )
         input_weight: float = Field(
             default=0.00069,
@@ -279,6 +309,13 @@ class Filter:
         return f"oi-rate-limiter:{namespace}:{user_id}:credits"
 
     @staticmethod
+    def _anchor_key(namespace: str, user_id: str, window: str) -> str:
+        """Start-of-period anchor for a fixed-anchor window. Value is the
+        period-start timestamp (epoch seconds); a per-user, per-window key so
+        the weekly period is independent of any other fixed windows."""
+        return f"oi-rate-limiter:{namespace}:{user_id}:anchor:{window}"
+
+    @staticmethod
     def _holds_key(namespace: str, user_id: str) -> str:
         return f"oi-rate-limiter:{namespace}:{user_id}:holds"
 
@@ -474,6 +511,63 @@ class Filter:
                 continue
         return total
 
+    def _window_mode(self) -> str:
+        """Normalized weekly-window mode valve."""
+        return (
+            "sliding" if str(self.valves.window_mode).strip() == "sliding" else "fixed-anchor"
+        )
+
+    def _fixed_start(self, user_id: str, model_id: str, now: float) -> Optional[float]:
+        """Current fixed-anchor period start for the weekly window, or None
+        when the window mode is sliding.
+
+        The anchor is created on first call (the user's first request starts
+        their first period) and advanced to `now` once the period has expired
+        — OpenAI Codex semantics: the new period starts with the user's next
+        request, not at a fixed wall-clock moment, so idle time between
+        periods does not consume the fresh allowance."""
+        if self._window_mode() != "fixed-anchor":
+            return None
+        namespace = self._get_namespace(model_id)
+        key = self._anchor_key(namespace, user_id, "weekly")
+        r = self._get_redis()
+        window_secs = self.valves.credit_window_minutes * 60
+
+        raw = r.get(key)
+        start = float(raw) if raw else None
+        if start is None:
+            r.set(key, now, ex=int(window_secs * 2))
+            return now
+        if now >= start + window_secs:
+            start = now
+            r.set(key, start, ex=int(window_secs * 2))
+        return start
+
+    def _window_bounds(
+        self, user_id: str, model_id: str, now: float, win_secs: float
+    ) -> Tuple[float, str, Optional[float]]:
+        """(min_score, max_score, fixed_start) for a window's usage query.
+        Sliding: records in [now - win_secs, +inf]. Fixed-anchor weekly:
+        records in [period_start, +inf] with fixed_start = period start
+        (None for sliding windows).
+
+        Only the weekly window honors window_mode; the session and minute
+        windows are always sliding (matching z.ai's per-credit 5-hour
+        refresh). The weekly window is identified by its length matching
+        credit_window_minutes — a session configured to the same length
+        simply can't be distinguished, but that would be a pathological
+        configuration."""
+        fixed_start = None
+        min_score = now - win_secs
+        if (
+            self._window_mode() == "fixed-anchor"
+            and win_secs == self.valves.credit_window_minutes * 60
+        ):
+            fixed_start = self._fixed_start(user_id, model_id, now)
+            if fixed_start is not None:
+                min_score = fixed_start
+        return min_score, "+inf", fixed_start
+
     def _used_with_holds(
         self, user_id: str, model_id: str, now: float, win_secs: float
     ) -> Tuple[int, Optional[float]]:
@@ -484,13 +578,14 @@ class Filter:
         credit_key = self._credit_key(namespace, user_id)
         holds_key = self._holds_key(namespace, user_id)
 
-        used = self._sum_credits(credit_key, now - win_secs, "+inf")
-        earliest = self._earliest_key(credit_key, now - win_secs, "+inf")
+        min_score, _, _ = self._window_bounds(user_id, model_id, now, win_secs)
+        used = self._sum_credits(credit_key, min_score, "+inf")
+        earliest = self._earliest_key(credit_key, min_score, "+inf")
 
         # Holds are "{ts}:{uuid}:{amount}" with a key TTL bounding their life;
         # score-based pruning mirrors it in case the TTL has not fired yet.
         # Hold amounts are fractional like charges.
-        for member in self._get_redis().zrangebyscore(holds_key, now - win_secs, "+inf"):
+        for member in self._get_redis().zrangebyscore(holds_key, min_score, "+inf"):
             try:
                 used += float(member.rsplit(":", 1)[1])
             except (ValueError, IndexError):
@@ -523,11 +618,50 @@ class Filter:
         (b) before holds are gone, records having aged out enough to cover
             the full overage including holds (conservative: assumes every
             hold lives to its TTL). The result never quotes a time earlier
-            than the true recovery."""
+            than the true recovery.
+
+        Fixed-anchor weekly windows have an exact recovery time — the period
+        end — so no projection is needed; the wait is that timestamp (never
+        earlier than the hold TTL bound, since a live hold can still push a
+        fresh period's usage over the limit)."""
         namespace = self._get_namespace(model_id)
         credit_key = self._credit_key(namespace, user_id)
         holds_key = self._holds_key(namespace, user_id)
         r = self._get_redis()
+
+        # Fixed-anchor weekly: recovery is either the period end (committed
+        # in-period credits alone are at/over the limit — only rollover
+        # restores the budget) or the hold TTL bound (holds alone push a
+        # fresh period over; they expire in minutes).
+        if (
+            self._window_mode() == "fixed-anchor"
+            and win_secs == self.valves.credit_window_minutes * 60
+        ):
+            fixed_start = self._fixed_start(user_id, model_id, now)
+            if fixed_start is None:
+                return 1
+            committed = self._sum_credits(credit_key, fixed_start, "+inf")
+            latest_hold_ts = None
+            for member in r.zrangebyscore(holds_key, "-inf", "+inf"):
+                try:
+                    latest_hold_ts = max(
+                        latest_hold_ts or 0.0, float(member.split(":")[0])
+                    )
+                except (ValueError, IndexError):
+                    continue
+            if committed >= limit:
+                wait = fixed_start + win_secs - now
+                # A pathological hold_ttl longer than the window could keep
+                # usage over even after rollover — never quote earlier.
+                if latest_hold_ts is not None:
+                    hold_end = latest_hold_ts + self.valves.hold_ttl_minutes * 60
+                    wait = max(wait, hold_end - now)
+                return max(1, int(wait))
+            # Holds alone: they expire with their key TTL.
+            if latest_hold_ts is not None:
+                hold_end = latest_hold_ts + self.valves.hold_ttl_minutes * 60
+                return max(1, int(hold_end - now))
+            return 1
 
         records = []
         for member in r.zrangebyscore(credit_key, now - win_secs, "+inf"):

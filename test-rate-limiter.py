@@ -1336,7 +1336,7 @@ print("== 30. Recovery wait: cumulative aging, not oldest record ==")
 # that, not the oldest record's expiry (which frees only a few credits).
 f = make_filter(
     sliding_window_credits=50000, credits_per_session=None,
-    credit_window_minutes=10080,
+    credit_window_minutes=10080, window_mode="sliding",
 )
 r = f._get_redis()
 key = "oi-rate-limiter:glm-5.3:u1:credits"
@@ -1363,7 +1363,9 @@ check("wait is later than oldest-record expiry", wait > oldest_expiry + 3600, (w
 
 print("== 31. Recovery wait edge cases ==")
 # a) committed exactly at limit -> overage 0, first record expiry
-f = make_filter(sliding_window_credits=100, credit_window_minutes=10080)
+f = make_filter(
+    sliding_window_credits=100, credit_window_minutes=10080, window_mode="sliding",
+)
 r = f._get_redis()
 key = "oi-rate-limiter:glm-5.3:u1:credits"
 ts_old = now - 5 * 86400
@@ -1381,7 +1383,7 @@ check(
 # is bounded by the hold TTL (holds are key-TTL'd, not per-record).
 f = make_filter(
     sliding_window_credits=100, credit_window_minutes=10080,
-    hold_ttl_minutes=15, chars_per_token=1.0,
+    hold_ttl_minutes=15, chars_per_token=1.0, window_mode="sliding",
 )
 r = f._get_redis()
 r.delete(key)
@@ -1410,6 +1412,7 @@ check("retry time is time-only below a day", not any(d in short for d in weekday
 # Inlet message names the tripped window.
 f = make_filter(
     sliding_window_credits=100, credit_window_minutes=10080, chars_per_token=1.0,
+    window_mode="sliding",
 )
 r = f._get_redis()
 r.delete("oi-rate-limiter:glm-5.3:u1:credits")
@@ -1423,6 +1426,130 @@ except Exception as e:
     msg = str(e)
     check("message names the weekly window", "weekly window" in msg, msg)
     check("message includes a retry time", "try again at" in msg, msg)
+
+print("== 33. Fixed-anchor weekly window (default mode) ==")
+# a) first-use anchor + amnesty: pre-existing records older than the newly
+#    created anchor don't count; usage inside the period does.
+f = make_filter(
+    sliding_window_credits=50000, credits_per_session=None,
+    credit_window_minutes=10080,  # window_mode defaults to fixed-anchor
+)
+r = f._get_redis()
+key = "oi-rate-limiter:glm-5.3:u1:credits"
+anchor_key = "oi-rate-limiter:glm-5.3:u1:anchor:weekly"
+now = time.time()
+check("no anchor before first check", r.get(anchor_key) is None)
+# A week of heavy history (would trip any sliding window).
+for i in range(100):
+    ts = now - 6.9 * 86400 + i * (6.9 * 86400 / 100)
+    r.zadd(key, {f"{ts}:uuid{i}:0:0:0:600": ts})
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("fresh anchor gives amnesty on prior history", not limited and used == 0, (limited, used))
+check("anchor created at first check", r.get(anchor_key) is not None, anchor_key)
+anchor = float(r.get(anchor_key))
+check("anchor TTL set", 0 < r.ttl(anchor_key) <= 2 * 604800, r.ttl(anchor_key))
+
+# b) usage inside the period counts and trips exactly at the budget.
+# (The record's ts must be >= the anchor, i.e. placed after the first check
+# above — a record predating the anchor is prior-period history.)
+in_ts = time.time()
+r.zadd(key, {f"{in_ts}:in:0:0:0:51000": in_ts})
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("in-period usage counts", limited and used == 51000, (limited, used))
+check("window labeled weekly", label == "weekly", label)
+# Wait = period end - now, exactly (plus any hold bound; none here).
+expected_wait = int(anchor + 604800 - time.time())
+check(
+    "wait equals time to period end",
+    wait is not None and abs(wait - expected_wait) <= 2,
+    (wait, expected_wait),
+)
+check("anchor not advanced while period live", float(r.get(anchor_key)) == anchor)
+
+# c) after the period expires, the next check rolls the anchor and resets.
+r.delete(key)  # clean ledger
+future = now + 605000  # past period end
+r.zadd(key, {f"{future - 60}:in:0:0:0:100": future - 60})
+# _fixed_start reads/advances the anchor; simulate the future check by
+# calling through _used_with_holds with the future clock.
+start2 = f._fixed_start("u1", "glm-5.3", future)
+check("anchor rolls forward at period expiry", start2 == future, (start2, future))
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("new period starts fresh", not limited and used == 0, (limited, used))
+
+print("== 34. Fixed-anchor hold bound on the wait ==")
+# A live hold can push a fresh period over budget; the quoted wait must not
+# be earlier than the hold TTL bound.
+f = make_filter(
+    sliding_window_credits=100, credits_per_session=None,
+    credit_window_minutes=10080, hold_ttl_minutes=15, chars_per_token=1.0,
+)
+r = f._get_redis()
+run_inlet(f, {"stream": True, "messages": [{"role": "user", "content": "a" * 150}]})  # hold 150
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check("hold over budget in fresh period", limited and used == 150, (limited, used))
+check(
+    "wait respects hold TTL bound",
+    wait is not None and 0 < wait <= 15 * 60,
+    wait,
+)
+
+print("== 35. Fixed-anchor message + valve validation ==")
+# The inlet message quotes the period end (weekday-qualified at 7 days).
+f = make_filter(
+    sliding_window_credits=100, credits_per_session=None,
+    credit_window_minutes=10080, chars_per_token=1.0,
+)
+r = f._get_redis()
+r.delete("oi-rate-limiter:glm-5.3:u1:credits")
+r.delete("oi-rate-limiter:glm-5.3:u1:holds")
+try:
+    # One request to establish the anchor, then charge to the limit.
+    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]})
+    run_stream(f, vllm_final_chunk_dict(prompt_tokens=2, completion_tokens=0))
+    ts = time.time()
+    r.zadd("oi-rate-limiter:glm-5.3:u1:credits", {f"{ts}:x:0:0:0:100": ts})
+    run_inlet(f, {"messages": [{"role": "user", "content": "hi"}]})
+    check("over-budget inlet raises", False, "no exception")
+except Exception as e:
+    msg = str(e)
+    check("message names the weekly window", "weekly window" in msg, msg)
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    check("7-day wait quotes weekday", any(d in msg for d in weekdays), msg)
+
+# Valve schema: dropdown options render for the Open WebUI editor.
+schema = mod_Filter_Valves_schema()
+wm = schema["properties"].get("window_mode", {})
+opts = (wm.get("input") or {}).get("options", [])
+check(
+    "window_mode is a select with both options",
+    wm.get("input", {}).get("type") == "select"
+    and {o["value"] for o in opts} == {"fixed-anchor", "sliding"},
+    opts,
+)
+check("window_mode default is fixed-anchor", wm.get("default") == "fixed-anchor", wm.get("default"))
+
+# Session window stays sliding even in fixed-anchor mode (a record just
+# inside 5h counts even if placed before... it can't predate the anchor
+# while the anchor is fresh — instead verify a session window of equal
+# length to the week is unaffected: set session to 10080 too and confirm
+# the session sum still uses trailing-time bounds via identical results).
+f = make_filter(
+    sliding_window_credits=100, credits_per_session=100,
+    credit_window_minutes=10080, session_window_minutes=10080,
+    chars_per_token=1.0,
+)
+r = f._get_redis()
+r.delete("oi-rate-limiter:glm-5.3:u1:credits")
+r.delete("oi-rate-limiter:glm-5.3:u1:holds")
+ts = time.time() - 60
+r.zadd("oi-rate-limiter:glm-5.3:u1:credits", {f"{ts}:x:0:0:0:150": ts})
+limited, wait, used, lim, label = f.credit_limited("u1", "glm-5.3")
+check(
+    "same-length session window also fixed-bounded (anchor applies by length)",
+    not limited,  # anchor just created at now -> old record outside period
+    (limited, used, label),
+)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

@@ -78,6 +78,7 @@ check("admin allowed", not out.startswith("Error"))
 
 print("== 2. Query across namespaces ==")
 t = make_tool()
+t.valves.window_mode = "sliding"
 add_record(t, "glm-5.3", "u1", 10000, 90000, 5000, 34)
 add_record(t, "glm-5.3", "u1", 500, 0, 200, 30, age_secs=3)  # young record
 add_record(t, "qwen-3.5", "u1", 1000, 0, 100, 10)
@@ -98,6 +99,7 @@ check("no records message", "No credit records found" in out, out)
 
 print("== 3. Old records fall out of windows ==")
 t = make_tool()
+t.valves.window_mode = "sliding"
 add_record(t, "glm-5.3", "u1", 100, 0, 0, 7, age_secs=6 * 3600)  # 6h old
 out = run(t.query_credit_usage(user="u1", __user__=admin()))
 check("6h-old record outside 5h session", "session (5h): 0 credits of 2000 budget (0.0%) over 0 requests" in out, out)
@@ -106,6 +108,7 @@ check("all-time keeps it", "all time: 7 credits over 1 requests" in out, out)
 
 print("== 3b. Window budgets in usage reports ==")
 t = make_tool()
+t.valves.window_mode = "sliding"
 add_record(t, "glm-5.3", "u1", 10000, 90000, 5000, 34)
 add_record(t, "glm-5.3", "u1", 500, 0, 200, 30, age_secs=3)
 out = run(t.query_credit_usage(user="u1", __user__=admin()))
@@ -209,6 +212,7 @@ check(
 
 print("== 8c. Adjust credits (admin) ==")
 t = make_tool()
+t.valves.window_mode = "sliding"
 add_record(t, "glm-5.3", "u1", 1000, 0, 100, 30)
 add_record(t, "qwen-3.5", "u1", 500, 0, 50, 20)
 
@@ -395,6 +399,7 @@ _mod.Users = None  # restore for any later sections
 
 print("== 10. Recovery projection on over-budget windows ==")
 t = make_tool()
+t.valves.window_mode = "sliding"
 t.valves.sliding_window_credits = 50000
 t.valves.credits_per_session = None  # isolate the week window
 now = time.time()
@@ -436,6 +441,87 @@ print("== 11. Duration formatting ==")
 check("hours format", Tools._fmt_duration(2.5 * 3600) == "2.5 hours", Tools._fmt_duration(2.5 * 3600))
 check("minutes format", Tools._fmt_duration(12 * 60) == "12 min", Tools._fmt_duration(12 * 60))
 check("days format", Tools._fmt_duration(2.6 * 86400) == "2.6 days", Tools._fmt_duration(2.6 * 86400))
+
+print("== 12. Fixed-anchor weekly reporting (default mode) ==")
+# a) no anchor yet: prior records are outside the not-yet-started period.
+t = make_tool()  # window_mode defaults to fixed-anchor
+now = time.time()
+for i in range(3):
+    add_record(t, "glm-5.3", "u1", 0, 0, 0, 10, age_secs=i * 3600)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "no anchor -> weekly usage 0 until the user's next request",
+    "week: 0 credits of 10000 budget (0.0%) over 0 requests" in out,
+    out,
+)
+check("all-time still totals records", "all time: 30 credits over 3 requests" in out, out)
+
+# b) live anchor: records inside the period count, older ones don't.
+t = make_tool()
+r = t._get_redis()
+anchor = now - 3600  # period started an hour ago
+r.set("oi-rate-limiter:glm-5.3:u1:anchor:weekly", anchor)
+add_record(t, "glm-5.3", "u1", 0, 0, 0, 40, age_secs=1800)   # inside period
+add_record(t, "glm-5.3", "u1", 0, 0, 0, 70, age_secs=7200)   # prior period
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "weekly usage counts from the anchor",
+    "week: 40 credits of 10000 budget (0.4%)" in out
+    and "over 1 requests" in out,
+    out,
+)
+check(
+    "reset time reported from anchor + week",
+    "resets in" in out and "days" in out,
+    out,
+)
+
+# c) over budget in fixed mode: shows reset time, not a recovery projection.
+t = make_tool()
+t.valves.sliding_window_credits = 100
+r = t._get_redis()
+r.set("oi-rate-limiter:glm-5.3:u1:anchor:weekly", now - 3600)
+add_record(t, "glm-5.3", "u1", 0, 0, 0, 150, age_secs=1800)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "over-budget fixed window shows reset line",
+    "resets in" in out and "over budget, recovers in" not in out,
+    out,
+)
+
+# d) expired anchor: budget resets with the user's next request.
+t = make_tool()
+r = t._get_redis()
+r.set("oi-rate-limiter:glm-5.3:u1:anchor:weekly", now - 8 * 86400)
+add_record(t, "glm-5.3", "u1", 0, 0, 0, 500, age_secs=4 * 86400)
+out = run(t.query_credit_usage(user="u1", __user__=admin()))
+check(
+    "expired period shows reset-pending note",
+    "period ended, budget resets with the user's next request" in out,
+    out,
+)
+
+print("== 13. Clear deletes window anchors ==")
+t = make_tool()
+r = t._get_redis()
+r.set("oi-rate-limiter:glm-5.3:u1:anchor:weekly", now - 3600)
+r.set("oi-rate-limiter:qwen-3.5:u1:anchor:weekly", now - 60)
+add_record(t, "glm-5.3", "u1", 0, 0, 0, 10)
+add_record(t, "qwen-3.5", "u1", 0, 0, 0, 20)
+out = run(t.clear_credit_usage(user="u1", namespace="glm-5.3", confirm=True, __user__=admin()))
+check(
+    "clear reports deleted anchor",
+    "1 window anchor" in out,
+    out,
+)
+check("scoped anchor deleted", not r.exists("oi-rate-limiter:glm-5.3:u1:anchor:weekly"))
+check("other namespace anchor survives", r.exists("oi-rate-limiter:qwen-3.5:u1:anchor:weekly"))
+out = run(t.clear_credit_usage(user="u1", confirm=True, __user__=admin()))
+check(
+    "un-namespaced clear sweeps all anchors",
+    "1 window anchor" in out and not list(r.scan_iter(match="oi-rate-limiter:*:u1:anchor:*")),
+    out,
+)
 
 print()
 print(f"RESULTS: {PASS} passed, {FAIL} failed")

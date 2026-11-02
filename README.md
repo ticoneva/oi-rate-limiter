@@ -65,14 +65,36 @@ lets cache hits be discounted. Set all weights to `1.0` (the default) and the
 budget is a plain total-token limit.
 
 When a budget is exceeded, the rejection message names the tripped window and
-quotes the time the limit will lift. That time is a *cumulative aging*
-projection: the limit recovers only when the total charge of records that
-have aged out of the window exceeds the overage — not when the oldest single
-record expires (a user 20 credits over stays blocked until 20+ credits' worth
-of records age out, which can be days after the oldest record's expiry).
-Waits under a day are quoted as a time ("12:10 AM"); waits of a day or more
-include the weekday ("Wed 09:42 PM") so multi-day recoveries are not mistaken
-for same-day ones.
+quotes the time the limit will lift. Waits under a day are quoted as a time
+("12:10 AM"); waits of a day or more include the weekday ("Wed 09:42 PM") so
+multi-day recoveries are not mistaken for same-day ones.
+
+**Weekly-window semantics** (`window_mode`) — the weekly budget behaves like
+a subscription allowance, in either of two modes:
+
+- **`fixed-anchor` (default)**: the weekly budget is a per-user *period*.
+  The period starts with the user's first request (their "anchor", stored in
+  Redis) and every `credit_window_minutes` after it, the budget resets to
+  full — the next request after expiry starts a fresh period, so idle time
+  between periods doesn't consume the fresh allowance (OpenAI Codex
+  semantics; z.ai anchors the cycle to the subscription date instead).
+  Usage counts only records inside the current period, and a limited user's
+  retry time is exact: the period end. A user migrating from `sliding` mode
+  gets a one-time amnesty — their next request starts a fresh period and
+  prior records don't count. The trade-off: back-to-back periods allow a
+  burst of up to 2× budget straddling a rollover, which sliding prevents.
+- **`sliding`**: the weekly budget counts credits spent in the trailing 7
+  days, recovering gradually as charges age out. The quoted retry time is a
+  *cumulative aging* projection: the limit lifts only when the total charge
+  of aged-out records exceeds the overage — not when the oldest single
+  record expires (a user 20 credits over stays blocked until 20+ credits'
+  worth of records age out, which can be days later). At steady usage a
+  sliding limit can hold a user throttled indefinitely — the reason
+  fixed-anchor is the default.
+
+The session (5-hour) window is always sliding regardless of `window_mode`,
+matching z.ai's per-credit 5-hour refresh ("credit quota resets 5 hours
+after consumption").
 
 Charges are stored **fractionally** (full precision, 6 decimals) — a short
 prompt that costs 0.141 credits records 0.141, so many small requests
@@ -218,6 +240,7 @@ the same field).
 | `session_window_minutes` | 300 | Session credit window duration in minutes |
 | `sliding_window_credits` | 10000 | Credit budget per credit window — z.ai Lite weekly allowance |
 | `credit_window_minutes` | 10080 | Credit sliding window duration in minutes (7 days) |
+| `window_mode` | fixed-anchor | Weekly-window semantics: `fixed-anchor` (budget resets fully every 7 days, period anchored to the user's first request — z.ai/OpenAI subscription style) or `sliding` (budget counts credits spent in the trailing 7 days) |
 | `input_weight` | 0.00069 | Credit cost of one uncached prefill token (z.ai GLM-5.3 input multiplier ÷ 10,000) |
 | `cached_input_weight` | 0.00017 | Credit cost of one cache-hit prefill token (z.ai GLM-5.3 cached multiplier ÷ 10,000) |
 | `output_weight` | 0.0024 | Credit cost of one decode token (z.ai GLM-5.3 output multiplier ÷ 10,000) |
@@ -252,6 +275,9 @@ multipliers) — one credit unit equals one z.ai credit. For the Pro plan
 - `oi-rate-limiter:{namespace}:{user_id}:credits` — credit records; sorted-set
   members are `{timestamp}:{uuid}:{uncached_in}:{cached_in}:{out}:{charged}`
   so raw splits survive for reporting and re-derivation
+- `oi-rate-limiter:{namespace}:{user_id}:anchor:weekly` — start timestamp of
+  the user's current fixed-anchor weekly period (created on first request,
+  rolled forward at period expiry); absent in `sliding` window_mode
 - `oi-rate-limiter:{namespace}:{user_id}:holds` — admission holds; members are
   `{timestamp}:{uuid}:{amount}`, TTL-bounded
 - `oi-rate-limiter:{namespace}:{user_id}:done:{chat_id}:{message_id}` —
@@ -293,9 +319,14 @@ same instance.
   and all-time windows. The session and weekly lines each report usage as
   `used of budget (percent)` against the tool's `credits_per_session` and
   `sliding_window_credits` valves — keep them equal to the filter's valves
-  of the same names (the window-length valves too) for exact percentages,
-  or set a limit to None to report that window without a budget. A window at
-  or over its budget additionally projects its recovery time, e.g.
+  of the same names (the window-length valves too, and `window_mode`) for
+  exact percentages, or set a limit to None to report that window without a
+  budget. In `fixed-anchor` mode (default) the weekly line reads the user's
+  period anchor from Redis and reports the exact reset time, e.g.
+  `week: 4500 of 10000 budget (45.0%) — resets in 3.2 days (Wed 09:42 PM)`;
+  with no anchor yet it reports 0 until the user's next request starts
+  their first period. In `sliding` mode, a window at or over its budget
+  instead projects its recovery time, e.g.
   `week: 50018.7 of 50000 budget (100.0%) — over budget, recovers in 2.6 days (Wed 09:42 PM)`,
   using the same cumulative-aging math as the filter's rejection message
   (records only — pending holds are not read, so a hold-driven overage may
@@ -311,11 +342,11 @@ same instance.
   sanitized copy of `reason` and shows up in usage reports as a "manual
   adjustments" line. Scoped to one namespace or all of the user's namespaces.
 - **`clear_credit_usage(user, namespace="", confirm=false)`** — admin-only.
-  Deletes the user's credit records (and pending holds and in-flight slots)
-  for one namespace or all, resetting their budget and freeing their
-  concurrency slots. Requires `confirm=true` to act, so a model
-  misunderstanding cannot wipe data. This is also the escape hatch if a user
-  ever reports being stuck at the concurrency limit.
+  Deletes the user's credit records (and pending holds, in-flight slots, and
+  weekly-window anchors) for one namespace or all, resetting their budget
+  and freeing their concurrency slots. Requires `confirm=true` to act, so a
+  model misunderstanding cannot wipe data. This is also the escape hatch if
+  a user ever reports being stuck at the concurrency limit.
 
 Permissions: **admins** may query, adjust, and clear anyone's usage (an empty
 `user` means themselves). **Everyone else** may only **query their own**

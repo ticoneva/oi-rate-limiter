@@ -2,7 +2,7 @@
 title: Credit Usage Admin Tool
 author: Vinci Chow
 author_url: https://github.com/ticoneva
-version: 0.7.0
+version: 0.8.0
 license: MIT
 
 Admin-only companion to the Rate and Credit Limit Filter. Queries a user's
@@ -78,6 +78,17 @@ class Tools:
                 "Weekly-window credit budget to report usage against. Must "
                 "match the filter's valve of the same name for exact "
                 "percentages; None reports the window without a budget."
+            ),
+        )
+        window_mode: str = Field(
+            default="fixed-anchor",
+            description=(
+                "Weekly-window mode — must match the filter's window_mode "
+                "valve. fixed-anchor: usage counts from the user's period "
+                "anchor and the budget resets when the period rolls over; "
+                "the report shows the reset time. sliding: usage counts over "
+                "the trailing week and an over-budget window shows a "
+                "recovery projection."
             ),
         )
 
@@ -342,18 +353,23 @@ class Tools:
         display = _display(resolved)
 
         now = time.time()
+        week_secs = self.valves.credit_window_minutes * 60
+        fixed_mode = str(self.valves.window_mode).strip() != "sliding"
+
         windows = [
             (
                 "session (5h)",
                 self.valves.session_window_minutes * 60,
                 self.valves.credits_per_session,
+                False,
             ),
             (
                 "week",
-                self.valves.credit_window_minutes * 60,
+                week_secs,
                 self.valves.sliding_window_credits,
+                fixed_mode,
             ),
-            ("all time", None, None),
+            ("all time", None, None, False),
         ]
 
         namespaces = self._namespaces_for_user(r, user_id)
@@ -371,6 +387,28 @@ class Tools:
 
         lines = [f"Credit usage for {display}:"]
         for ns, key in namespaces:
+            # Fixed-anchor weekly: the filter's per-user period anchor. When
+            # present, weekly usage counts from it and the budget resets at
+            # anchor + week; absent means the user's period starts with
+            # their next request (fresh anchor) — their prior records don't
+            # count toward the current period.
+            anchor = None
+            if fixed_mode:
+                raw = r.get(f"oi-rate-limiter:{ns}:{user_id}:anchor:weekly")
+                if raw:
+                    try:
+                        anchor = float(raw)
+                    except ValueError:
+                        anchor = None
+                # A period already past its end reads as reset-pending: the
+                # filter will roll the anchor on the user's next request.
+                if anchor is not None and now >= anchor + week_secs:
+                    reset_pending = True
+                else:
+                    reset_pending = False
+            else:
+                reset_pending = False
+
             members = r.zrange(key, 0, -1, withscores=True)
             parsed = [self._member_usage(m) for m, _ in members]
             parsed = [p for p in parsed if p is not None]
@@ -401,10 +439,20 @@ class Tools:
                     f"  manual adjustments: {len(adjustments)}, "
                     f"net {sign}{self._fmt(abs(net))} credits (included in the totals above)"
                 )
-            for label, win_secs, limit in windows:
+            for label, win_secs, limit, is_fixed_week in windows:
                 if win_secs is None:
                     subset = parsed
                     reqs = requests
+                elif is_fixed_week and anchor is not None:
+                    # Count from the period anchor, not the trailing week.
+                    subset = [p for p in parsed if p[0] >= anchor]
+                    reqs = [p for p in requests if p[0] >= anchor]
+                elif is_fixed_week:
+                    # No anchor yet: the user's current period hasn't started
+                    # (it begins with their next request), so prior records
+                    # are outside it.
+                    subset = []
+                    reqs = []
                 else:
                     subset = [p for p in parsed if p[0] > now - win_secs]
                     reqs = [p for p in requests if p[0] > now - win_secs]
@@ -417,12 +465,27 @@ class Tools:
                     summary += (
                         f" of {self._fmt(limit)} budget ({pct:.1f}%)"
                     )
-                    # Over budget: project when aged-out credits bring usage
-                    # back under (records only — the tool does not read the
-                    # filter's holds, so a hold-driven overage shows a
-                    # projection based on committed records, which ages out
-                    # no later).
-                    if charged >= limit:
+                    if is_fixed_week:
+                        # Fixed-anchor: the reset time is exact.
+                        if anchor is not None:
+                            reset_in = anchor + week_secs - now
+                            if reset_pending:
+                                summary += (
+                                    " — period ended, budget resets with "
+                                    "the user's next request"
+                                )
+                            elif reset_in > 0:
+                                summary += (
+                                    f" — resets in {self._fmt_duration(reset_in)} "
+                                    f"({self._fmt_recovery_time(reset_in)})"
+                                )
+                        # No anchor: nothing to reset from yet.
+                    elif charged >= limit:
+                        # Sliding over budget: project when aged-out credits
+                        # bring usage back under (records only — the tool
+                        # does not read the filter's holds, so a hold-driven
+                        # overage shows a projection based on committed
+                        # records, which ages out no later).
                         win_records = [(p[0], p[4]) for p in subset]
                         recover = self._recovery_seconds(
                             win_records, limit, win_secs, now
@@ -493,10 +556,16 @@ class Tools:
             inflight_keys = list(
                 r.scan_iter(match=f"oi-rate-limiter:*:{user_id}:inflight")
             )
+            anchor_keys = list(
+                r.scan_iter(match=f"oi-rate-limiter:*:{user_id}:anchor:*")
+            )
         else:
             hold_keys = [f"oi-rate-limiter:{namespace.strip()}:{user_id}:holds"]
             inflight_keys = [
                 f"oi-rate-limiter:{namespace.strip()}:{user_id}:inflight"
+            ]
+            anchor_keys = [
+                f"oi-rate-limiter:{namespace.strip()}:{user_id}:anchor:weekly"
             ]
 
         deleted_credits = 0
@@ -504,12 +573,13 @@ class Tools:
             deleted_credits += r.delete(key)
         deleted_holds = sum(r.delete(k) for k in hold_keys)
         deleted_inflight = sum(r.delete(k) for k in inflight_keys)
+        deleted_anchors = sum(r.delete(k) for k in anchor_keys)
 
         cleared_ns = ", ".join(ns for ns, _ in targets)
         parts = [
             f"Cleared usage for {display}.",
             f"Namespaces: {cleared_ns}",
-            f"Deleted keys: {deleted_credits} credit, {deleted_holds} hold, {deleted_inflight} in-flight",
+            f"Deleted keys: {deleted_credits} credit, {deleted_holds} hold, {deleted_inflight} in-flight, {deleted_anchors} window anchor",
         ]
         return ". ".join(parts)
 

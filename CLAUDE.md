@@ -82,6 +82,11 @@ middleware awaits them.
 - `oi-rate-limiter:{ns}:{user}:est:{turn_id}` — points at the credit record
   holding a bare API turn's inlet-time non-streaming estimate, so an outlet
   invocation replaces it with exact usage instead of double-charging
+- `oi-rate-limiter:{ns}:{user}:anchor:weekly` — start of the user's current
+  fixed-anchor weekly period (filter v1.4.0+; `window_mode` valve, default
+  fixed-anchor). Created on first request, rolled to `now` at period expiry
+  (OpenAI-Codex-style first-use anchoring). Session/minute windows are
+  always sliding. Admin tool's clear deletes anchors.
 
 ## Hook wiring (verified against v0.9.6 middleware source AND live probes)
 
