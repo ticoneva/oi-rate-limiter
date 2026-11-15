@@ -29,14 +29,13 @@ instead.
   Postgres and Redis (Valkey). scrp-chat resolves to the login node itself,
   which nginx-proxies to the container on `scrp-control-2:8086`
   (`/etc/nginx/sites-available/chat`).
-- **The running Open WebUI is v0.12.3** (verified 2026-11-02 via
-  `GET /api/version` on both hostnames). Never trust `oi-launch.sh` for the
-  version — its container name currently matches (open-webui-v0.12.3) but
-  it still mounts the old `open-webui-v0.8.10-data/` volume and has been
-  stale before. `/api/version` is the direct check. Current
-  `alembic_version`: 0bd252b206fb. Diffing deployed `function`/`tool`
-  content against local files confirms what filter/tool code is actually
-  running.
+- **The running Open WebUI is v0.12.5** (container `open-webui-v0.12.5`,
+  seen via `docker ps` on scrp-control-2 2026-11-14; earlier verified
+  v0.12.3 via `GET /api/version` on both hostnames — re-verify by that
+  method when it matters). Never trust `oi-launch.sh` for the
+  version — it has been stale before. `/api/version` is the direct check.
+  Diffing deployed `function`/`tool` content against local files confirms
+  what filter/tool code is actually running.
 - **`ENABLE_API_OUTLET_FILTERS` is not set in the real launch script** —
   v0.12.3's default is True, so **API-path outlet filters are ON** on this
   deployment. (The repo's `oi-launch.sh` says "false"; it is stale — the
@@ -52,6 +51,25 @@ instead.
   published port) and scrp-control-2 accepts no SSH from login nodes. Live
   ledger inspection requires running code through the deployment itself
   (e.g. the admin tool in chat); diagnose from code + valves otherwise.
+- **On scrp-control-2 itself**, `redis-cli -h <IP>` works against the
+  Valkey container's bridge IP (get it with `docker inspect -f
+  '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redis-valkey`;
+  172.18.0.2 as of 2026-11-14). `docker exec` has been broken HOST-WIDE
+  since ~2026-11-06 (every exec dies on an AppArmor error, ExitCode -1),
+  which is also why both containers show "(unhealthy)" — their healthchecks
+  run via exec. Inspect with `docker inspect`/`docker logs`/bridge-IP
+  redis-cli instead; don't trust the unhealthy badges.
+- **Valkey runs with `timeout 1800`** (idle non-pubsub connections reaped
+  after 30 min — not the default 0; provenance of the setting unknown, it
+  may return on container restart unless persisted). This surfaced as
+  `Error 32 ... Broken pipe` on the admin tool (its pool sits idle for
+  hours between invocations; the filter's never does). Fixed client-side
+  in v1.4.1/v0.8.1 via `socket_keepalive=True, health_check_interval=30`
+  in `_get_redis` (redis-py PINGs a pooled connection idle >=30s before
+  reuse and reconnects transparently — keep these options in future
+  client construction). Server-side `CONFIG SET timeout 0` (2026-11-14,
+  runtime only) was also applied; if broken pipe recurs after a Valkey
+  restart, re-check this setting first.
 - Deployment = paste the .py into the function/tool in the Open WebUI UI
   (Workspace → Functions/Tools). Editing reloads the module. There is no
   file-based deploy.

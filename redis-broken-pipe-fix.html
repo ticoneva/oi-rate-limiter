@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis "Broken Pipe" Fix — credit-admin-tool</title>
+<style>
+  :root {
+    --ink: #1a1f2b;
+    --muted: #5b6472;
+    --line: #d9dee6;
+    --bg: #ffffff;
+    --code-bg: #f4f6f9;
+    --accent: #0f4c81;
+    --ok: #1a7f4b;
+    --warn: #a25a00;
+    --bad: #b03030;
+  }
+  html { background: #eceff3; }
+  body {
+    font-family: Georgia, "Times New Roman", serif;
+    max-width: 46rem;
+    margin: 2rem auto;
+    padding: 3rem 3.5rem;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.65;
+    box-shadow: 0 1px 8px rgba(0,0,0,.08);
+  }
+  h1 { font-size: 1.7rem; margin: 0 0 .2rem; }
+  h2 { font-size: 1.2rem; margin-top: 2.2rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  h3 { font-size: 1.0rem; margin-top: 1.6rem; }
+  .subtitle { color: var(--muted); margin-bottom: 1.8rem; font-size: .95rem; }
+  code, pre { font-family: "SF Mono", Consolas, Menlo, monospace; }
+  code { background: var(--code-bg); padding: .1rem .35rem; border-radius: 3px; font-size: .85em; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px;
+    padding: .8rem 1rem; overflow-x: auto; font-size: .82rem; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; }
+  .ok { color: var(--ok); font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .callout {
+    border-left: 4px solid var(--accent); background: var(--code-bg);
+    padding: .8rem 1.1rem; margin: 1.2rem 0; border-radius: 0 5px 5px 0;
+  }
+  ul { padding-left: 1.4rem; }
+  li { margin: .3rem 0; }
+  .footer { margin-top: 2.5rem; padding-top: .8rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+
+<h1>Fixing <code>Error 32 &hellip; Broken pipe</code> in credit-admin-tool</h1>
+<div class="subtitle">scrp-chat / Open&nbsp;WebUI deployment &middot; diagnosed 2026-11-14</div>
+
+<h2>1. Symptom</h2>
+
+<p>Invoking the credit-admin-tool in chat fails with:</p>
+
+<pre><code>Error querying credit usage: Error 32 while writing to socket. Broken pipe.</code></pre>
+
+<p>The rate-limiter filter, by contrast, continues to work (credit keys kept
+receiving writes, and rate-limiter commands <code>zcount</code>, <code>eval</code>,
+<code>zrangebyscore</code> were observed running live during diagnosis).</p>
+
+<h2>2. Diagnosis</h2>
+
+<h3>2.1 What was ruled out</h3>
+
+<ul>
+  <li><strong>Valkey server down or unhealthy.</strong> BGSAVEs were completing
+      successfully right up to the moment of diagnosis; the server answered
+      <code>PING</code> with <code>PONG</code>; <code>rejected_connections:0</code>;
+      53 of 10,000 client slots in use.</li>
+  <li><strong>The "(unhealthy)" container badges.</strong> These are an artifact:
+      <code>docker exec</code> has been broken host-wide on scrp-control-2 since
+      &asymp;&nbsp;Nov&nbsp;6 (the healthcheck exec died on an AppArmor error,
+      FailingStreak&nbsp;=&nbsp;713,689 &asymp; 8.3 days of once-per-second failures).
+      The healthchecks run <em>via</em> exec, so they fail while the services
+      themselves run fine.</li>
+</ul>
+
+<h3>2.2 Root cause</h3>
+
+<div class="callout">
+<p><strong>Valkey's <code>timeout</code> is set to 1800&nbsp;seconds.</strong> The
+server closes any non-pubsub connection that has been idle for more than
+30&nbsp;minutes.</p>
+</div>
+
+<p>This bites the admin tool specifically because of how the two components use
+their connections:</p>
+
+<table>
+  <tr><th></th><th>Rate-limiter filter</th><th>credit-admin-tool</th></tr>
+  <tr><td>Frequency</td><td>Every chat request</td><td>Only when invoked in chat (hours/days apart)</td></tr>
+  <tr><td>Pool idle time</td><td>Never approaches 30&nbsp;min</td><td>Routinely exceeds 30&nbsp;min</td></tr>
+  <tr><td>Result</td><td class="ok">Connections stay alive</td><td class="bad">Valkey reaps the pooled socket between invocations</td></tr>
+</table>
+
+<p>Both components create their client once and reuse it
+(<code>self._redis</code>, built with a bare <code>redis.from_url(...)</code>).
+When the admin tool is invoked after a long gap, redis-py writes the command
+into the already-closed socket &rarr; <code>Error 32 &hellip; Broken pipe</code>.
+This is a client-side view of the server having closed the connection, not a
+server crash.</p>
+
+<h3>2.3 Corroborating evidence from <code>CLIENT LIST</code></h3>
+
+<ul>
+  <li>Pubsub connections (<code>flags=P</code>) survive despite
+      <code>idle</code> far above 1800&nbsp;s &mdash; pubsub clients are exempt
+      from the <code>timeout</code> reaper, exactly as expected.</li>
+  <li>Every normal connection showed <code>idle</code> below 1800&nbsp;s &mdash;
+      consistent with active reaping at that threshold rather than random drops.</li>
+  <li><code>tcp-keepalive=300</code> does not mitigate this: Valkey's
+      <code>timeout</code> is an application-level idle counter reset only by
+      <em>commands</em>, not by TCP keepalive probes.</li>
+</ul>
+
+<h2>3. The fixes</h2>
+
+<h3>3.1 Temporary / immediate fix (runtime)</h3>
+
+<p>Run on scrp-control-2 (the bridge IP of the <code>redis-valkey</code>
+container was <code>172.18.0.2</code> at diagnosis time; re-derive it with
+<code>docker inspect</code> if it has changed):</p>
+
+<pre><code>IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redis-valkey)
+redis-cli -h $IP CONFIG SET timeout 0</code></pre>
+
+<p>This takes effect immediately for the running Valkey &mdash; the server stops
+reaping idle connections &mdash; but <strong>does not survive a container
+restart</strong> if the 1800 value comes from a config file or startup command.</p>
+
+<div class="callout">
+<p><strong>One-time retry note:</strong> the admin tool's pool still holds its
+already-dead socket. If the first invocation after the fix fails once more,
+simply invoke it again &mdash; redis-py discards the broken connection and the
+next call gets a fresh one.</p>
+</div>
+
+<h3>3.2 Permanent fix</h3>
+
+<p><strong>Server side &mdash; persist the setting.</strong> Find where 1800
+comes from and make 0 the persisted value:</p>
+
+<pre><code># Option A: persist current runtime config to the mounted conf file (if writable)
+redis-cli -h $IP CONFIG REWRITE
+
+# Option B: inspect where the value is set, then edit it there
+docker inspect -f '{{json .Config.Cmd}}' redis-valkey     # startup command flags
+docker inspect -f '{{json .Mounts}}' redis-valkey         # mounted valkey.conf</code></pre>
+
+<p>Background: Valkey's own default for <code>timeout</code> is 0 (never reap),
+so 1800 was configured deliberately somewhere. Idle-connection hygiene is not
+needed here &mdash; only 53 of 10,000 client slots are in use &mdash; so setting
+it to 0 permanently is safe. After editing a mounted conf, restart the valkey
+container to confirm the setting sticks.</p>
+
+<p><strong>Client side &mdash; harden both components (recommended, optional).</strong>
+Even with <code>timeout&nbsp;0</code>, any future idle reaping or transient
+connection loss would resurface the same error, because both files build their
+client with bare defaults:</p>
+
+<pre><code>self._redis = _redis.from_url(self.valves.redis_url, decode_responses=True)</code></pre>
+
+<p>Patch <code>_get_redis()</code> in <strong>both</strong>
+<code>credit-admin-tool.py</code> and <code>rate-limiter.py</code>:</p>
+
+<pre><code>self._redis = _redis.from_url(
+    self.valves.redis_url,
+    decode_responses=True,
+    socket_keepalive=True,      # OS-level keepalive on pooled sockets
+    health_check_interval=30,   # PING before reuse; dead conn detected &amp; reconnected
+)</code></pre>
+
+<p><code>health_check_interval</code> is the load-bearing option: on the first
+command after &ge;&nbsp;30&nbsp;s of pool idle time, redis-py silently issues a
+<code>PING</code>, detects a dead connection, and reconnects &mdash; the failure
+becomes invisible instead of surfacing as a broken pipe. Per repo conventions
+this patch would be a version bump in both files' frontmatter, followed by
+re-pasting them into the Open WebUI Workspace (editing reloads the module).</p>
+
+<h2>4. Verification</h2>
+
+<pre><code># 1. Setting took effect
+redis-cli -h $IP CONFIG GET timeout          # expect: 0
+
+# 2. Ledger is current (newest credit record vs. now)
+for k in $(redis-cli -h $IP --scan --pattern 'oi-rate-limiter:*:credits'); do
+  redis-cli -h $IP ZRANGE "$k" -1 -1 WITHSCORES | tr '\n' ' '; echo "  $k"
+done | sort -k2 -n | tail -3
+date +%s                                     # scores within minutes = live</code></pre>
+
+<p>Then invoke the credit-admin-tool in chat &mdash; possibly twice, per the
+retry note above &mdash; and confirm usage queries return normally.</p>
+
+<h2>5. Side findings (unrelated to this bug, worth tracking)</h2>
+
+<ul>
+  <li><strong><code>docker exec</code> broken host-wide since &asymp;&nbsp;Nov&nbsp;6</strong>
+      &mdash; every exec dies on
+      <em>"Could not check if docker-default AppArmor profile was loaded"</em>
+      (<code>ExitCode: -1</code>). Likely a kernel/AppArmor update regression;
+      check <code>dmesg | grep -i apparmor</code> and recent package history.
+      This is also the sole reason both containers show "(unhealthy)".</li>
+  <li><strong>Open WebUI is now v0.12.5</strong> (container
+      <code>open-webui-v0.12.5</code>, created 11 days before diagnosis), not
+      the v0.12.3 previously recorded. Version-specific behavior notes
+      (Anthropic conversion path, outlet-filter defaults) should be re-verified
+      against the v0.12.5 source and the Postgres <code>function</code>/<code>tool</code>
+      tables.</li>
+</ul>
+
+<div class="footer">
+oi-rate-limiter project &middot; scrp-chat deployment &middot; report generated 2026-11-14
+</div>
+
+</body>
+</html>

@@ -2,7 +2,7 @@
 title: Credit Usage Admin Tool
 author: Vinci Chow
 author_url: https://github.com/ticoneva
-version: 0.8.0
+version: 0.8.1
 license: MIT
 
 Admin-only companion to the Rate and Credit Limit Filter. Queries a user's
@@ -100,7 +100,16 @@ class Tools:
         if self._redis is None:
             import redis as _redis
 
-            self._redis = _redis.from_url(self.valves.redis_url, decode_responses=True)
+            # socket_keepalive + health_check_interval: PING a pooled
+            # connection idle >=30s before reuse; if the server reaped it
+            # (e.g. Valkey `timeout`), redis-py reconnects transparently
+            # instead of surfacing "Error 32 ... Broken pipe".
+            self._redis = _redis.from_url(
+                self.valves.redis_url,
+                decode_responses=True,
+                socket_keepalive=True,
+                health_check_interval=30,
+            )
         return self._redis
 
     async def _resolve_user(self, query: str) -> Optional[dict]:

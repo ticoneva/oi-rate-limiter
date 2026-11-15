@@ -3,7 +3,7 @@ title: Rate and Credit Limit Filter
 author: Vinci Chow
 author_url: https://github.com/ticoneva
 funding_url: https://github.com/open-webui
-version: 1.4.0
+version: 1.4.1
 license: MIT
 """
 
@@ -297,7 +297,18 @@ class Filter:
         if self._redis is None:
             import redis as _redis
 
-            self._redis = _redis.from_url(self.valves.redis_url, decode_responses=True)
+            # socket_keepalive: OS-level probes keep NATs/firewalls from
+            # silently dropping the pooled socket. health_check_interval:
+            # before reusing a connection idle >=30s, redis-py PINGs it and
+            # transparently reconnects if the server reaped it (e.g. Valkey
+            # `timeout`), so a stale pool surfaces as self-healing instead
+            # of "Error 32 ... Broken pipe".
+            self._redis = _redis.from_url(
+                self.valves.redis_url,
+                decode_responses=True,
+                socket_keepalive=True,
+                health_check_interval=30,
+            )
         return self._redis
 
     @staticmethod
